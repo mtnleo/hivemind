@@ -2,13 +2,19 @@
 // Sprint 2: Telegram URL → Jina Reader → Gemini classify+summarize → Supabase + Obsidian write → reply.
 // YouTube / X / Instagram are deferred to Sprint 3. This file only handles web URLs.
 //
-// Source-of-truth for the live n8n workflow. Pass to mcp__n8n__create_workflow_from_code,
-// then publish_workflow to activate.
+// Source-of-truth for the live n8n workflow (workflow id NAp209DrgQQHN5ec).
+// MCP `create_workflow_from_code` has reproducible 500 bugs — deploy via raw REST API:
+// PUT https://n8n.mtnleo-n8n.org/api/v1/workflows/<id> with body { name, nodes, connections, settings }
+// then POST /activate. See README for full procedure.
 //
-// Credentials referenced by NAME must exist in n8n UI:
-//   - telegram-hivemind   (Telegram API)
-//   - supabase-hivemind   (Postgres → aws-1-us-east-2.pooler.supabase.com:5432, ssl=require)
-//   - gemini-api-key      (HTTP Header Auth, header `x-goog-api-key`)
+// Credentials referenced in n8n UI:
+//   - Telegram account            (telegramApi)
+//   - Postgres account            (postgres → Supabase pooler aws-1-us-east-2:5432, ssl=require)
+//   - Google Gemini(PaLM) Api account  (googlePalmApi → reused for HTTP node via nodeCredentialType)
+//
+// REQUIRED n8n env var (else writeFile fails with "is not writable"):
+//   N8N_RESTRICT_FILE_ACCESS_TO=/files
+// Default is `~/.n8n-files` which blocks the vault path.
 //
 // Vault path inside the n8n container is `/files/obsidian-vault` (host bind mount on the Pi).
 
@@ -98,13 +104,11 @@ const extractUrl = node({
     parameters: {
       mode: 'runOnceForEachItem',
       language: 'javaScript',
-      jsCode: `
-const crypto = require('crypto');
-
-const msg = $json.message || {};
+      // n8n Code node sandbox blocks `require('crypto')`. Skip hashing —
+      // store normalized URL as `url_hash`; UNIQUE constraint still dedups.
+      jsCode: `const msg = $json.message || {};
 const text = (msg.text || msg.caption || '').trim();
 const match = text.match(/https?:\\/\\/[^\\s]+/);
-
 if (!match) {
   return {
     json: {
@@ -115,13 +119,11 @@ if (!match) {
     }
   };
 }
-
 const TRACKING = new Set([
   'utm_source','utm_medium','utm_campaign','utm_term','utm_content','utm_id',
   'gclid','fbclid','mc_cid','mc_eid','igshid','ref','ref_src','ref_url',
   's','si','feature','app'
 ]);
-
 let normalized = match[0];
 try {
   const u = new URL(match[0]);
@@ -132,10 +134,8 @@ try {
   for (const [k, v] of kept) u.searchParams.append(k, v);
   if (u.pathname.length > 1 && u.pathname.endsWith('/')) u.pathname = u.pathname.slice(0, -1);
   normalized = u.toString();
-} catch (_) { /* keep raw */ }
-
-const urlHash = crypto.createHash('sha256').update(normalized).digest('hex');
-
+} catch (_) { }
+const urlHash = normalized;
 return {
   json: {
     hasUrl: true,
@@ -146,8 +146,7 @@ return {
     chatId: msg.chat.id,
     telegramMsgId: msg.message_id
   }
-};
-`.trim()
+};`
     },
     position: [440, 400]
   },
@@ -236,7 +235,10 @@ const geminiClassify = node({
       method: 'POST',
       url: GEMINI_URL,
       authentication: 'predefinedCredentialType',
-      nodeCredentialType: 'httpHeaderAuth',
+      // Reuse the existing `Google Gemini(PaLM) Api account` cred via HTTP node.
+      // n8n sends `x-goog-api-key` header automatically. Avoids needing a
+      // separate httpHeaderAuth cred.
+      nodeCredentialType: 'googlePalmApi',
       sendBody: true,
       contentType: 'json',
       specifyBody: 'json',
@@ -256,7 +258,11 @@ const geminiClassify = node({
 }) }}`),
       options: { timeout: 60000 }
     },
-    credentials: { httpHeaderAuth: newCredential('gemini-api-key') },
+    credentials: { googlePalmApi: newCredential('Google Gemini(PaLM) Api account') },
+    // Gemini API occasionally returns 503; retry transparently.
+    retryOnFail: true,
+    maxTries: 4,
+    waitBetweenTries: 3000,
     position: [1160, 240]
   },
   output: [{
@@ -277,11 +283,9 @@ const parseClassification = node({
     parameters: {
       mode: 'runOnceForEachItem',
       language: 'javaScript',
-      jsCode: `
-const ex = $('Extract URL').item.json;
+      jsCode: `const ex = $('Extract URL').item.json;
 const jinaItem = $('Jina Reader').item;
 const jina = jinaItem ? (jinaItem.json.data || jinaItem.json.body || '') : '';
-
 let parsed;
 try {
   const text = $json.candidates[0].content.parts[0].text;
@@ -296,7 +300,8 @@ try {
     suggested_must_read: false
   };
 }
-
+const VALID_WS = new Set(['AI & LLMs','Dev Tools','System Design & Architecture','Productivity & Workflow','Fitness & Gym','Health & Nutrition','Career & Leadership','Inbox']);
+const workspace = VALID_WS.has(parsed.workspace) ? parsed.workspace : 'Inbox';
 function slugify(s) {
   return (s || '')
     .toLowerCase()
@@ -305,24 +310,21 @@ function slugify(s) {
     .replace(/^-+|-+$/g, '')
     .slice(0, 60) || 'untitled';
 }
-
 const date = new Date().toISOString().slice(0, 10);
 const slug = slugify(parsed.title);
 const filename = date + '-' + slug + '.md';
-const obsidianPath = '${VAULT_BASE}/' + parsed.workspace + '/' + filename;
+const obsidianPath = '${VAULT_BASE}/' + workspace + '/' + filename;
 const rawContent = (jina + '').slice(0, ${RAW_CONTENT_TRUNCATE});
-
 const pgArray = '{' + (parsed.tags || []).map(t => '"' + String(t).replace(/"/g, '\\\\"') + '"').join(',') + '}';
-
 return {
   json: {
     url: ex.url,
     url_hash: ex.urlHash,
     source_type: 'web',
-    workspace: parsed.workspace,
+    workspace: workspace,
     title: parsed.title,
     summary: parsed.summary,
-    key_points: JSON.stringify(parsed.key_points || []),
+    key_points: parsed.key_points || [],
     tags: pgArray,
     must_read: !!parsed.suggested_must_read,
     raw_content: rawContent,
@@ -335,8 +337,7 @@ return {
     _key_points: parsed.key_points || [],
     _tags: parsed.tags || []
   }
-};
-`.trim()
+};`
     },
     position: [1400, 240]
   },
@@ -354,15 +355,39 @@ const supabaseInsert = node({
     parameters: {
       resource: 'database',
       operation: 'executeQuery',
-      query: `insert into hivemind.bookmarks
+      // n8n's `queryReplacement` is naive comma-split — any value containing a
+      // comma (titles, summaries) shatters the param list. Collapse all values
+      // into a single `$1::jsonb` parameter and extract columns inside SQL.
+      query: `with payload as (select $1::jsonb as p)
+insert into hivemind.bookmarks
   (url, url_hash, source_type, workspace, title, summary, key_points, tags, must_read, raw_content, telegram_msg_id, obsidian_path)
-values
-  ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::text[], $9, $10, $11, $12)
+select
+  p->>'url',
+  p->>'url_hash',
+  p->>'source_type',
+  p->>'workspace',
+  p->>'title',
+  p->>'summary',
+  p->'key_points',
+  (p->>'tags')::text[],
+  (p->>'must_read')::bool,
+  p->>'raw_content',
+  (p->>'telegram_msg_id')::int,
+  p->>'obsidian_path'
+from payload
 on conflict (url_hash) do update set
-  url = excluded.url
+  url = excluded.url,
+  workspace = excluded.workspace,
+  title = excluded.title,
+  summary = excluded.summary,
+  key_points = excluded.key_points,
+  tags = excluded.tags,
+  must_read = excluded.must_read,
+  raw_content = excluded.raw_content,
+  obsidian_path = excluded.obsidian_path
 returning id;`,
       options: {
-        queryReplacement: expr('={{ $json.url }},{{ $json.url_hash }},{{ $json.source_type }},{{ $json.workspace }},{{ $json.title }},{{ $json.summary }},{{ $json.key_points }},{{ $json.tags }},{{ $json.must_read }},{{ $json.raw_content }},{{ $json.telegram_msg_id }},{{ $json.obsidian_path }}')
+        queryReplacement: expr('={{ JSON.stringify($json) }}')
       }
     },
     credentials: { postgres: newCredential('supabase-hivemind') },
@@ -382,8 +407,7 @@ const renderMarkdown = node({
     parameters: {
       mode: 'runOnceForEachItem',
       language: 'javaScript',
-      jsCode: `
-const meta = $('Parse + Derive').item.json;
+      jsCode: `const meta = $('Parse + Derive').item.json;
 const supabaseId = $json.id;
 
 const fm = [
@@ -439,8 +463,7 @@ return {
       fileName: meta._filename
     }
   }
-};
-`.trim()
+};`
     },
     position: [1880, 240]
   },
@@ -455,11 +478,15 @@ const writeFile = node({
   version: 1.1,
   config: {
     name: 'Write Vault File',
+    // IMPORTANT: requires `N8N_RESTRICT_FILE_ACCESS_TO=/files` env on the n8n
+    // container, otherwise n8n blocks writes outside `~/.n8n-files` with a
+    // misleading "is not writable" error. Workspace subdirs must also exist
+    // beforehand — n8n's writeFile does NOT create parents.
     parameters: {
       operation: 'write',
       fileName: expr('={{ $json.obsidian_path }}'),
       dataPropertyName: 'data',
-      options: {}
+      options: { append: false }
     },
     position: [2120, 240]
   },

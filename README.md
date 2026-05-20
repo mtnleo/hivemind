@@ -40,6 +40,43 @@ Personal AI-powered bookmark hive mind. Send any URL (article, YouTube, tweet, I
 2. Import the three workflows from `n8n/workflows/` into your n8n instance.
 3. Send a URL to your bot.
 
+## Required n8n container config
+
+The ingest workflow writes Obsidian markdown files into `/files/obsidian-vault/`
+inside the n8n container (host bind mount). n8n's `restrictFileAccessTo` defaults
+to `~/.n8n-files`, which blocks the vault path with a misleading
+**"is not writable"** error.
+
+Add to the n8n service env in `docker-compose.yml`:
+
+```yaml
+environment:
+  - N8N_RESTRICT_FILE_ACCESS_TO=/files
+```
+
+Then `docker compose up -d` to recreate the container. The workspace subdirs
+(`AI & LLMs`, `Dev Tools`, …) must also exist on the host beforehand — n8n's
+`readWriteFile` node does **not** create parents.
+
+## Deploying ingest workflow
+
+n8n's MCP `create_workflow_from_code` has reproducible 500 bugs. Deploy via raw
+REST API instead:
+
+```bash
+# Update
+curl -X PUT https://<your-n8n>/api/v1/workflows/<id> \
+  -H "X-N8N-API-KEY: ..." -H "Content-Type: application/json" \
+  --data @workflow.json
+# Activate
+curl -X POST https://<your-n8n>/api/v1/workflows/<id>/activate \
+  -H "X-N8N-API-KEY: ..."
+```
+
+Body must include `name`, `nodes`, `connections`, `settings` only. Readonly
+fields (`availableInMCP`, `binaryMode`, `staticData`, `versionId`, etc.) cause
+400 errors if passed back unchanged.
+
 ## Build status
 
 See [`docs/architecture.md`](docs/architecture.md) for the full architecture and current build sprint.
