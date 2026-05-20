@@ -1,0 +1,12 @@
+.env
+.env.local
+*.log
+.DS_Store
+node_modules/
+
+# n8n exports may contain credential references — sanitize before committing
+# (n8n's "Download" preserves only credential IDs, not secrets, so these are safe)
+
+# Local Obsidian vault (the template stays, the live vault doesn't)
+obsidian-vault/
+!obsidian-vault-template/
