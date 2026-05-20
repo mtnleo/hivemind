@@ -4,11 +4,12 @@ Three workflows live under `workflows/` as exported JSON. They are imported into
 
 | File | Purpose | Built in sprint |
 |---|---|---|
-| `workflows/01-ingest.json` | Telegram URL → fetch → Gemini classify+summarize → Supabase + Obsidian write → reply | S2 + S3 + S4 |
-| `workflows/02-ask.json` | `/ask` → embed → pgvector match → Gemini RAG → reply | S5 |
-| `workflows/03-commands.json` | `/star`, `/list`, `/recent`, `/help` | S6 |
+| `workflows/00-ping.ts` | S1 sanity check: Telegram → Postgres count → reply `pong — N bookmark(s) saved` | S1 ✅ |
+| `workflows/01-ingest.ts` | Telegram URL → fetch → Gemini classify+summarize → Supabase + Obsidian write → reply | S2 + S3 + S4 |
+| `workflows/02-ask.ts` | `/ask` → embed → pgvector match → Gemini RAG → reply | S5 |
+| `workflows/03-commands.ts` | `/star`, `/list`, `/recent`, `/help` | S6 |
 
-Files don't exist yet — they get exported from n8n at the end of each sprint that builds them.
+Workflows are stored as **n8n Workflow SDK TypeScript source** (the input to `create_workflow_from_code`), NOT exported JSON. That's the source of truth — the live workflow in n8n is regenerable from this code via the n8n MCP. JSON exports are redundant.
 
 ## Conventions for the workflows
 
