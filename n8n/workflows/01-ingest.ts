@@ -1,6 +1,10 @@
-// Hivemind — Ingest (web articles)
-// Sprint 2: Telegram URL → Jina Reader → Gemini classify+summarize → Supabase + Obsidian write → reply.
-// YouTube / X / Instagram are deferred to Sprint 3. This file only handles web URLs.
+// Hivemind — Ingest (web + YouTube + X + Instagram)
+// Sprint 3: Telegram URL → Extract URL (host-detect) → Has URL? → Route Source (switch)
+//           → per-source Jina fetch → Gemini classify+summarize → Supabase + Obsidian → reply.
+//
+// Per-source fetch nodes today all use Jina Reader (r.jina.ai/<url>). Same API surface,
+// distinct nodes so each branch can be swapped later (e.g. yt-dlp transcript service for
+// YouTube, syndication endpoint for X). Switch routes on `sourceType` set by Extract URL.
 //
 // Source-of-truth for the live n8n workflow (workflow id NAp209DrgQQHN5ec).
 // MCP `create_workflow_from_code` has reproducible 500 bugs — deploy via raw REST API:
@@ -18,7 +22,7 @@
 //
 // Vault path inside the n8n container is `/files/obsidian-vault` (host bind mount on the Pi).
 
-import { workflow, node, trigger, ifElse, newCredential, expr } from '@n8n/workflow-sdk';
+import { workflow, node, trigger, ifElse, switchNode, newCredential, expr } from '@n8n/workflow-sdk';
 
 // ---------------------------------------------------------------------------
 // Inline classify system prompt — mirrors prompts/classify.md.
@@ -125,9 +129,11 @@ const TRACKING = new Set([
   's','si','feature','app'
 ]);
 let normalized = match[0];
+let host = '';
 try {
   const u = new URL(match[0]);
   u.hostname = u.hostname.toLowerCase().replace(/^www\\./, '');
+  host = u.hostname;
   u.hash = '';
   const kept = [...u.searchParams.entries()].filter(([k]) => !TRACKING.has(k.toLowerCase()));
   u.search = '';
@@ -135,14 +141,22 @@ try {
   if (u.pathname.length > 1 && u.pathname.endsWith('/')) u.pathname = u.pathname.slice(0, -1);
   normalized = u.toString();
 } catch (_) { }
-const urlHash = normalized;
+function detectSource(h) {
+  if (!h) return 'web';
+  if (h === 'youtube.com' || h === 'm.youtube.com' || h === 'youtu.be' || h.endsWith('.youtube.com')) return 'youtube';
+  if (h === 'x.com' || h === 'twitter.com' || h === 'mobile.twitter.com' || h === 'mobile.x.com') return 'x';
+  if (h === 'instagram.com' || h.endsWith('.instagram.com')) return 'instagram';
+  return 'web';
+}
+const sourceType = detectSource(host);
 return {
   json: {
     hasUrl: true,
     url: match[0],
     normalizedUrl: normalized,
-    urlHash,
-    sourceType: 'web',
+    urlHash: normalized,
+    host,
+    sourceType,
     chatId: msg.chat.id,
     telegramMsgId: msg.message_id
   }
@@ -203,8 +217,59 @@ const telegramNoUrl = node({
 });
 
 // ---------------------------------------------------------------------------
-// 4b. Fetch article via Jina Reader (free, no auth). Returns markdown-ish text.
+// 4b. Route Source — Switch v3 branches by sourceType set in Extract URL.
+//     All 4 branches currently use Jina Reader (same fetch, separate nodes so
+//     each can be swapped later — e.g. yt-dlp transcript service for YouTube).
 // ---------------------------------------------------------------------------
+const routeSource = node({
+  type: 'n8n-nodes-base.switch',
+  version: 3.2,
+  config: {
+    name: 'Route Source',
+    parameters: {
+      rules: {
+        values: [
+          {
+            conditions: {
+              options: { caseSensitive: true, leftValue: '', typeValidation: 'loose' },
+              conditions: [{ leftValue: expr('={{ $json.sourceType }}'), rightValue: 'web', operator: { type: 'string', operation: 'equals' } }],
+              combinator: 'and'
+            },
+            renameOutput: true, outputKey: 'web'
+          },
+          {
+            conditions: {
+              options: { caseSensitive: true, leftValue: '', typeValidation: 'loose' },
+              conditions: [{ leftValue: expr('={{ $json.sourceType }}'), rightValue: 'youtube', operator: { type: 'string', operation: 'equals' } }],
+              combinator: 'and'
+            },
+            renameOutput: true, outputKey: 'youtube'
+          },
+          {
+            conditions: {
+              options: { caseSensitive: true, leftValue: '', typeValidation: 'loose' },
+              conditions: [{ leftValue: expr('={{ $json.sourceType }}'), rightValue: 'x', operator: { type: 'string', operation: 'equals' } }],
+              combinator: 'and'
+            },
+            renameOutput: true, outputKey: 'x'
+          },
+          {
+            conditions: {
+              options: { caseSensitive: true, leftValue: '', typeValidation: 'loose' },
+              conditions: [{ leftValue: expr('={{ $json.sourceType }}'), rightValue: 'instagram', operator: { type: 'string', operation: 'equals' } }],
+              combinator: 'and'
+            },
+            renameOutput: true, outputKey: 'instagram'
+          }
+        ]
+      },
+      options: { fallbackOutput: 'extra', renameFallbackOutput: 'default' }
+    },
+    position: [920, 280]
+  }
+});
+
+// Jina fetch nodes — one per source so each branch is independently swappable.
 const jinaFetch = node({
   type: 'n8n-nodes-base.httpRequest',
   version: 4.4,
@@ -213,14 +278,62 @@ const jinaFetch = node({
     parameters: {
       method: 'GET',
       url: expr('=https://r.jina.ai/{{ $json.url }}'),
-      options: {
-        response: { response: { responseFormat: 'text' } },
-        timeout: 30000
-      }
+      options: { response: { response: { responseFormat: 'text' } }, timeout: 30000 }
     },
-    position: [920, 240]
+    position: [1160, 100]
   },
   output: [{ data: '# Example article\n\nBody text' }]
+});
+
+const jinaYoutube = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.4,
+  config: {
+    name: 'Jina (YouTube)',
+    // Jina returns page description for YT videos (no transcript). Gemini classifies
+    // from title+description — lands in Inbox when content too thin. Future: swap
+    // this node for a yt-dlp transcript service.
+    parameters: {
+      method: 'GET',
+      url: expr('=https://r.jina.ai/{{ $json.url }}'),
+      options: { response: { response: { responseFormat: 'text' } }, timeout: 30000 }
+    },
+    position: [1160, 240]
+  },
+  output: [{ data: 'YouTube video page text' }]
+});
+
+const jinaX = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.4,
+  config: {
+    name: 'Jina (X)',
+    // Jina works for public X/Twitter posts. Syndication fallback not needed for MVP.
+    parameters: {
+      method: 'GET',
+      url: expr('=https://r.jina.ai/{{ $json.url }}'),
+      options: { response: { response: { responseFormat: 'text' } }, timeout: 30000 }
+    },
+    position: [1160, 380]
+  },
+  output: [{ data: 'Tweet text' }]
+});
+
+const jinaInstagram = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.4,
+  config: {
+    name: 'Jina (Instagram)',
+    // Jina for IG: works for public posts, returns minimal text for login-walled.
+    // Login-walled → Gemini gets near-empty content → workspace=Inbox (by design).
+    parameters: {
+      method: 'GET',
+      url: expr('=https://r.jina.ai/{{ $json.url }}'),
+      options: { response: { response: { responseFormat: 'text' } }, timeout: 30000 }
+    },
+    position: [1160, 520]
+  },
+  output: [{ data: 'Instagram post text' }]
 });
 
 // ---------------------------------------------------------------------------
@@ -249,7 +362,7 @@ const geminiClassify = node({
     parts: [{
       text: JSON.stringify({
         url: $('Extract URL').item.json.url,
-        source_type: 'web',
+        source_type: $('Extract URL').item.json.sourceType || 'web',
         content: (($json.data || $json.body || '') + '').slice(0, ${RAW_CONTENT_TRUNCATE})
       })
     }]
@@ -263,7 +376,7 @@ const geminiClassify = node({
     retryOnFail: true,
     maxTries: 4,
     waitBetweenTries: 3000,
-    position: [1160, 240]
+    position: [1400, 280]
   },
   output: [{
     candidates: [{
@@ -284,8 +397,11 @@ const parseClassification = node({
       mode: 'runOnceForEachItem',
       language: 'javaScript',
       jsCode: `const ex = $('Extract URL').item.json;
-const jinaItem = $('Jina Reader').item;
-const jina = jinaItem ? (jinaItem.json.data || jinaItem.json.body || '') : '';
+// Read fetched text from whichever branch ran.
+const SOURCE_NODE = { web: 'Jina Reader', youtube: 'Jina (YouTube)', x: 'Jina (X)', instagram: 'Jina (Instagram)' };
+const fetchNodeName = SOURCE_NODE[ex.sourceType] || 'Jina Reader';
+let jina = '';
+try { const it = $(fetchNodeName).item; jina = (it && (it.json.data || it.json.body || '')) + ''; } catch (e) {}
 let parsed;
 try {
   const text = $json.candidates[0].content.parts[0].text;
@@ -296,7 +412,7 @@ try {
     title: ex.url,
     summary: 'AI summary failed — open URL manually.',
     key_points: [],
-    tags: ['web'],
+    tags: [ex.sourceType || 'web'],
     suggested_must_read: false
   };
 }
@@ -320,7 +436,7 @@ return {
   json: {
     url: ex.url,
     url_hash: ex.urlHash,
-    source_type: 'web',
+    source_type: ex.sourceType || 'web',
     workspace: workspace,
     title: parsed.title,
     summary: parsed.summary,
@@ -339,7 +455,7 @@ return {
   }
 };`
     },
-    position: [1400, 240]
+    position: [1640, 280]
   },
   output: [{ workspace: 'AI & LLMs', title: 'x', obsidian_path: '/files/obsidian-vault/AI & LLMs/2026-05-20-x.md' }]
 });
@@ -391,7 +507,7 @@ returning id;`,
       }
     },
     credentials: { postgres: newCredential('supabase-hivemind') },
-    position: [1640, 240]
+    position: [1880, 280]
   },
   output: [{ id: 1 }]
 });
@@ -465,7 +581,7 @@ return {
   }
 };`
     },
-    position: [1880, 240]
+    position: [2120, 280]
   },
   output: [{ supabase_id: 1, obsidian_path: '/files/obsidian-vault/AI & LLMs/2026-05-20-x.md' }]
 });
@@ -488,7 +604,7 @@ const writeFile = node({
       dataPropertyName: 'data',
       options: { append: false }
     },
-    position: [2120, 240]
+    position: [2360, 280]
   },
   output: [{ fileName: '/files/obsidian-vault/AI & LLMs/2026-05-20-x.md' }]
 });
@@ -509,23 +625,35 @@ const telegramOk = node({
       additionalFields: { appendAttribution: false }
     },
     credentials: { telegramApi: newCredential('telegram-hivemind') },
-    position: [2360, 240]
+    position: [2600, 280]
   },
   output: [{ ok: true }]
 });
 
 // ---------------------------------------------------------------------------
-// Wire it up. Linear happy path with ifElse for "no URL".
+// Wire it up.
+// telegramTrigger → extractUrl → urlGate
+//   FALSE → telegramNoUrl (terminal)
+//   TRUE  → routeSource (Switch)
+//             web       → jinaFetch    ─┐
+//             youtube   → jinaYoutube  ─┤→ geminiClassify → parseClassification
+//             x         → jinaX        ─┤   → supabaseInsert → renderMarkdown
+//             instagram → jinaInstagram─┘      → writeFile → telegramOk
 // ---------------------------------------------------------------------------
-export default workflow('hivemind-ingest', 'Hivemind — Ingest (web)')
+const shared = geminiClassify
+  .to(parseClassification)
+  .to(supabaseInsert)
+  .to(renderMarkdown)
+  .to(writeFile)
+  .to(telegramOk);
+
+export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube + X + Instagram)')
   .add(telegramTrigger)
   .to(extractUrl)
   .to(urlGate
-    .onTrue(jinaFetch
-      .to(geminiClassify)
-      .to(parseClassification)
-      .to(supabaseInsert)
-      .to(renderMarkdown)
-      .to(writeFile)
-      .to(telegramOk))
+    .onTrue(routeSource
+      .branch(0, jinaFetch.to(shared))
+      .branch(1, jinaYoutube.to(shared))
+      .branch(2, jinaX.to(shared))
+      .branch(3, jinaInstagram.to(shared)))
     .onFalse(telegramNoUrl));
