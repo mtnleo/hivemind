@@ -12,25 +12,25 @@
 //
 // Vault path inside the n8n container is `/files/obsidian-vault` (host bind mount on the Pi).
 
-import { workflow, node, trigger, newCredential, expr } from '@n8n/workflow-sdk';
+import { workflow, node, trigger, ifElse, newCredential, expr } from '@n8n/workflow-sdk';
 
 // ---------------------------------------------------------------------------
-// Static config — single place to tweak per environment.
-// Keep prompts inline so updating prompts/classify.md only needs a re-paste here.
+// Inline classify system prompt — mirrors prompts/classify.md.
+// n8n convention: prompts live in the workflow, not loaded from disk.
 // ---------------------------------------------------------------------------
 const CLASSIFY_SYSTEM_PROMPT = `You are a personal knowledge curator. Your job is to read a piece of content the user just saved and produce a structured JSON record for their hive-mind library.
 
 You will receive:
-- \`url\`: the source URL
-- \`source_type\`: one of \`youtube\`, \`x\`, \`web\`, \`instagram\`, \`note\`
-- \`content\`: the extracted full text (transcript, tweet body, article body, or the user's own note)
+- url: the source URL
+- source_type: one of youtube, x, web, instagram, note
+- content: the extracted full text (transcript, tweet body, article body, or the user's own note)
 
 You MUST return ONE JSON object, nothing else — no prose, no markdown fence, no comments. Schema:
 
 {
   "workspace": "<one of the workspaces below>",
-  "title": "<short, specific, ≤80 chars. Prefer the original title if good; otherwise rewrite>",
-  "summary": "<3–6 sentences. Capture the actual insight, not just a description. Past tense, third-person>",
+  "title": "<short, specific, max 80 chars. Prefer the original title if good; otherwise rewrite>",
+  "summary": "<3 to 6 sentences. Capture the actual insight, not just a description. Past tense, third-person>",
   "key_points": ["<bullet 1>", "<bullet 2>", "..."],
   "tags": ["<kebab-case>", "..."],
   "suggested_must_read": true | false
@@ -48,8 +48,8 @@ Workspaces (pick exactly one — case-sensitive):
 
 Rules:
 - One workspace only. If a piece spans two, pick the dominant one.
-- tags: 3–7 entries, kebab-case. Specific over generic.
-- suggested_must_read = true only for unusually high-signal items (primary sources, foundational papers, definitive guides). Default false.
+- tags: 3-7 entries, kebab-case. Specific over generic.
+- suggested_must_read = true only for unusually high-signal items. Default false.
 - summary: write what the reader will learn, not "the article discusses...".
 - title: never include the source name. Just the substance.
 - If content is empty / extraction failed: set workspace = "Inbox", summary = "Extraction failed — open URL manually.", key_points = [], tags = [source_type], suggested_must_read = false.`;
@@ -88,9 +88,7 @@ const telegramTrigger = trigger({
 });
 
 // ---------------------------------------------------------------------------
-// 2. Extract URL — regex first URL in message.text + normalize + sha256 hash.
-//    Sets hasUrl flag; downstream If node gates the rest of the pipeline.
-//    Normalization is the simplified inline version of scripts/normalize-url.js.
+// 2. Extract URL — regex first URL + simplified normalize + sha256 hash.
 // ---------------------------------------------------------------------------
 const extractUrl = node({
   type: 'n8n-nodes-base.code',
@@ -109,10 +107,12 @@ const match = text.match(/https?:\\/\\/[^\\s]+/);
 
 if (!match) {
   return {
-    hasUrl: false,
-    chatId: msg.chat ? msg.chat.id : null,
-    telegramMsgId: msg.message_id || null,
-    rawText: text
+    json: {
+      hasUrl: false,
+      chatId: msg.chat ? msg.chat.id : null,
+      telegramMsgId: msg.message_id || null,
+      rawText: text
+    }
   };
 }
 
@@ -137,13 +137,15 @@ try {
 const urlHash = crypto.createHash('sha256').update(normalized).digest('hex');
 
 return {
-  hasUrl: true,
-  url: match[0],
-  normalizedUrl: normalized,
-  urlHash,
-  sourceType: 'web',
-  chatId: msg.chat.id,
-  telegramMsgId: msg.message_id
+  json: {
+    hasUrl: true,
+    url: match[0],
+    normalizedUrl: normalized,
+    urlHash,
+    sourceType: 'web',
+    chatId: msg.chat.id,
+    telegramMsgId: msg.message_id
+  }
 };
 `.trim()
     },
@@ -152,8 +154,7 @@ return {
   output: [{
     hasUrl: true,
     url: 'https://www.anthropic.com/news/example-article',
-    normalizedUrl: 'https://anthropic.com/news/example-article',
-    urlHash: 'deadbeef…',
+    urlHash: 'deadbeef',
     sourceType: 'web',
     chatId: 8837789534,
     telegramMsgId: 42
@@ -161,29 +162,24 @@ return {
 });
 
 // ---------------------------------------------------------------------------
-// 3. URL gate — If node. True branch → fetch + classify + save. False branch → reply "no URL".
+// 3. URL gate — ifElse routes to fetch+save (true) or no-URL reply (false).
 // ---------------------------------------------------------------------------
-const urlGate = node({
+const urlGate = ifElse({
   type: 'n8n-nodes-base.if',
-  version: 2.2,
+  version: 2.3,
   config: {
     name: 'Has URL?',
     parameters: {
       conditions: {
-        options: { caseSensitive: true, leftValue: '', typeValidation: 'strict' },
-        combinator: 'and',
         conditions: [{
-          id: 'has-url',
-          operator: { type: 'boolean', operation: 'true', singleValue: true },
-          leftValue: expr('{{ $json.hasUrl }}'),
-          rightValue: ''
+          leftValue: expr('={{ $json.hasUrl }}'),
+          rightValue: true,
+          operator: { type: 'boolean', operation: 'true' }
         }]
-      },
-      options: {}
+      }
     },
     position: [680, 400]
-  },
-  output: [{ hasUrl: true }]
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -197,7 +193,7 @@ const telegramNoUrl = node({
     parameters: {
       resource: 'message',
       operation: 'sendMessage',
-      chatId: expr('{{ $("Extract URL").item.json.chatId }}'),
+      chatId: expr('={{ $json.chatId }}'),
       text: 'No URL detected in that message. Send me a web link to save.',
       additionalFields: { appendAttribution: false }
     },
@@ -209,26 +205,23 @@ const telegramNoUrl = node({
 
 // ---------------------------------------------------------------------------
 // 4b. Fetch article via Jina Reader (free, no auth). Returns markdown-ish text.
-//    On non-2xx Jina sets `continueOnFail` so the pipeline still hits Gemini with
-//    empty content; classify.md handles empty → Inbox.
 // ---------------------------------------------------------------------------
 const jinaFetch = node({
   type: 'n8n-nodes-base.httpRequest',
-  version: 4.2,
+  version: 4.4,
   config: {
     name: 'Jina Reader',
     parameters: {
       method: 'GET',
-      url: expr('https://r.jina.ai/{{ $json.url }}'),
+      url: expr('=https://r.jina.ai/{{ $json.url }}'),
       options: {
         response: { response: { responseFormat: 'text' } },
         timeout: 30000
       }
     },
-    onError: 'continueErrorOutput',
     position: [920, 240]
   },
-  output: [{ data: '# Example article\\n\\nBody text…' }]
+  output: [{ data: '# Example article\n\nBody text' }]
 });
 
 // ---------------------------------------------------------------------------
@@ -236,7 +229,7 @@ const jinaFetch = node({
 // ---------------------------------------------------------------------------
 const geminiClassify = node({
   type: 'n8n-nodes-base.httpRequest',
-  version: 4.2,
+  version: 4.4,
   config: {
     name: 'Gemini Classify',
     parameters: {
@@ -268,13 +261,13 @@ const geminiClassify = node({
   },
   output: [{
     candidates: [{
-      content: { parts: [{ text: '{"workspace":"AI & LLMs","title":"…","summary":"…","key_points":["…"],"tags":["…"],"suggested_must_read":false}' }] }
+      content: { parts: [{ text: '{"workspace":"AI & LLMs","title":"x","summary":"x","key_points":[],"tags":[],"suggested_must_read":false}' }] }
     }]
   }]
 });
 
 // ---------------------------------------------------------------------------
-// 6. Parse Gemini JSON + derive slug, date, obsidian_path. Truncate raw content.
+// 6. Parse Gemini JSON + derive slug, date, obsidian_path. Truncate raw.
 // ---------------------------------------------------------------------------
 const parseClassification = node({
   type: 'n8n-nodes-base.code',
@@ -286,7 +279,8 @@ const parseClassification = node({
       language: 'javaScript',
       jsCode: `
 const ex = $('Extract URL').item.json;
-const jina = $('Jina Reader').item ? ($('Jina Reader').item.json.data || $('Jina Reader').item.json.body || '') : '';
+const jinaItem = $('Jina Reader').item;
+const jina = jinaItem ? (jinaItem.json.data || jinaItem.json.body || '') : '';
 
 let parsed;
 try {
@@ -312,47 +306,45 @@ function slugify(s) {
     .slice(0, 60) || 'untitled';
 }
 
-const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+const date = new Date().toISOString().slice(0, 10);
 const slug = slugify(parsed.title);
 const filename = date + '-' + slug + '.md';
 const obsidianPath = '${VAULT_BASE}/' + parsed.workspace + '/' + filename;
 const rawContent = (jina + '').slice(0, ${RAW_CONTENT_TRUNCATE});
 
+const pgArray = '{' + (parsed.tags || []).map(t => '"' + String(t).replace(/"/g, '\\\\"') + '"').join(',') + '}';
+
 return {
-  url: ex.url,
-  url_hash: ex.urlHash,
-  source_type: 'web',
-  workspace: parsed.workspace,
-  title: parsed.title,
-  summary: parsed.summary,
-  key_points: JSON.stringify(parsed.key_points || []),
-  tags: '{' + (parsed.tags || []).map(t => '"' + String(t).replace(/"/g, '\\\\"') + '"').join(',') + '}', // PG text[] literal
-  must_read: !!parsed.suggested_must_read,
-  raw_content: rawContent,
-  telegram_msg_id: ex.telegramMsgId,
-  obsidian_path: obsidianPath,
-  chat_id: ex.chatId,
-  // Carry forward for Obsidian render:
-  _filename: filename,
-  _date: date,
-  _slug: slug,
-  _key_points: parsed.key_points || [],
-  _tags: parsed.tags || []
+  json: {
+    url: ex.url,
+    url_hash: ex.urlHash,
+    source_type: 'web',
+    workspace: parsed.workspace,
+    title: parsed.title,
+    summary: parsed.summary,
+    key_points: JSON.stringify(parsed.key_points || []),
+    tags: pgArray,
+    must_read: !!parsed.suggested_must_read,
+    raw_content: rawContent,
+    telegram_msg_id: ex.telegramMsgId,
+    obsidian_path: obsidianPath,
+    chat_id: ex.chatId,
+    _filename: filename,
+    _date: date,
+    _slug: slug,
+    _key_points: parsed.key_points || [],
+    _tags: parsed.tags || []
+  }
 };
 `.trim()
     },
     position: [1400, 240]
   },
-  output: [{
-    workspace: 'AI & LLMs',
-    title: '…',
-    obsidian_path: '/files/obsidian-vault/AI & LLMs/2026-05-20-example.md'
-  }]
+  output: [{ workspace: 'AI & LLMs', title: 'x', obsidian_path: '/files/obsidian-vault/AI & LLMs/2026-05-20-x.md' }]
 });
 
 // ---------------------------------------------------------------------------
 // 7. Postgres INSERT into hivemind.bookmarks with RETURNING id.
-//    Parameterized via queryReplacement to avoid SQL injection on title/summary.
 // ---------------------------------------------------------------------------
 const supabaseInsert = node({
   type: 'n8n-nodes-base.postgres',
@@ -360,6 +352,7 @@ const supabaseInsert = node({
   config: {
     name: 'Insert Bookmark',
     parameters: {
+      resource: 'database',
       operation: 'executeQuery',
       query: `insert into hivemind.bookmarks
   (url, url_hash, source_type, workspace, title, summary, key_points, tags, must_read, raw_content, telegram_msg_id, obsidian_path)
@@ -380,7 +373,6 @@ returning id;`,
 
 // ---------------------------------------------------------------------------
 // 8. Render Obsidian markdown + prepare binary payload for the file write.
-//    Frontmatter includes supabase_id (from RETURNING) so /star can patch the file later.
 // ---------------------------------------------------------------------------
 const renderMarkdown = node({
   type: 'n8n-nodes-base.code',
@@ -452,15 +444,15 @@ return {
     },
     position: [1880, 240]
   },
-  output: [{ supabase_id: 1, obsidian_path: '/files/obsidian-vault/AI & LLMs/2026-05-20-example.md' }]
+  output: [{ supabase_id: 1, obsidian_path: '/files/obsidian-vault/AI & LLMs/2026-05-20-x.md' }]
 });
 
 // ---------------------------------------------------------------------------
-// 9. Write the markdown file into the Obsidian vault (inside container).
+// 9. Write markdown to the Obsidian vault (inside container).
 // ---------------------------------------------------------------------------
 const writeFile = node({
   type: 'n8n-nodes-base.readWriteFile',
-  version: 1,
+  version: 1.1,
   config: {
     name: 'Write Vault File',
     parameters: {
@@ -471,11 +463,11 @@ const writeFile = node({
     },
     position: [2120, 240]
   },
-  output: [{ fileName: '/files/obsidian-vault/AI & LLMs/2026-05-20-example.md' }]
+  output: [{ fileName: '/files/obsidian-vault/AI & LLMs/2026-05-20-x.md' }]
 });
 
 // ---------------------------------------------------------------------------
-// 10. Telegram reply: ✅ Saved to <workspace> + first 2 sentences of summary + /star hint.
+// 10. Telegram reply: ✅ Saved to <workspace> + 2 sentences + /star hint.
 // ---------------------------------------------------------------------------
 const telegramOk = node({
   type: 'n8n-nodes-base.telegram',
@@ -485,12 +477,8 @@ const telegramOk = node({
     parameters: {
       resource: 'message',
       operation: 'sendMessage',
-      chatId: expr('{{ $("Render Markdown").item.json.chat_id }}'),
-      text: expr(`={{
-        '✅ Saved to ' + $('Render Markdown').item.json.workspace + '\\n' +
-        (($('Render Markdown').item.json.summary || '').split(/(?<=[.!?])\\s+/).slice(0, 2).join(' ')) + '\\n' +
-        '/star ' + $('Render Markdown').item.json.supabase_id + ' to mark must-read'
-      }}`),
+      chatId: expr("={{ $('Render Markdown').item.json.chat_id }}"),
+      text: expr(`={{ '✅ Saved to ' + $('Render Markdown').item.json.workspace + '\\n' + (($('Render Markdown').item.json.summary || '').split(/(?<=[.!?])\\s+/).slice(0, 2).join(' ')) + '\\n/star ' + $('Render Markdown').item.json.supabase_id + ' to mark must-read' }}`),
       additionalFields: { appendAttribution: false }
     },
     credentials: { telegramApi: newCredential('telegram-hivemind') },
@@ -500,19 +488,17 @@ const telegramOk = node({
 });
 
 // ---------------------------------------------------------------------------
-// Wire it up. Linear happy path with one If branch for "no URL".
+// Wire it up. Linear happy path with ifElse for "no URL".
 // ---------------------------------------------------------------------------
 export default workflow('hivemind-ingest', 'Hivemind — Ingest (web)')
   .add(telegramTrigger)
   .to(extractUrl)
-  .to(urlGate)
-  .branch('true', flow => flow
-    .to(jinaFetch)
-    .to(geminiClassify)
-    .to(parseClassification)
-    .to(supabaseInsert)
-    .to(renderMarkdown)
-    .to(writeFile)
-    .to(telegramOk))
-  .branch('false', flow => flow
-    .to(telegramNoUrl));
+  .to(urlGate
+    .onTrue(jinaFetch
+      .to(geminiClassify)
+      .to(parseClassification)
+      .to(supabaseInsert)
+      .to(renderMarkdown)
+      .to(writeFile)
+      .to(telegramOk))
+    .onFalse(telegramNoUrl));
