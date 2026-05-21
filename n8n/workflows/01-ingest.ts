@@ -1018,6 +1018,7 @@ const formatResults = node({
       // gaps stay small and all 5 survive; on a lone-wolf query, only #1
       // survives. Keeps #1 always so the bot never reduces to "no results".
       jsCode: `const MAX_GAP = 0.10;
+const APOS = String.fromCharCode(39);
 const ex = $('Extract URL').first().json;
 const chatId = ex.chatId;
 const query = ex.searchQuery || '';
@@ -1039,7 +1040,10 @@ const lines = kept.map((it, i) => {
   const ws = r.workspace ? ' — [' + esc(r.workspace) + ']' : '';
   return (i + 1) + '. ' + star + esc(r.title || '(untitled)') + ws + '\\n   ' + esc(r.url || '');
 });
-const header = '🔍 Top ' + kept.length + ' for \\'' + esc(query) + '\\':';
+// Quote the query via APOS (= String.fromCharCode(39)) instead of literal
+// escaped apostrophes — survives bash → python → JSON round-trips through
+// deploy scripts without quote-escape rot.
+const header = '🔍 Top ' + kept.length + ' for ' + APOS + esc(query) + APOS + ':';
 return [{ json: { chat_id: chatId, text: header + '\\n' + lines.join('\\n') } }];`
     },
     position: [1400, 840]
