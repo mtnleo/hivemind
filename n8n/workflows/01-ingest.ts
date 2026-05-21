@@ -69,6 +69,9 @@ Rules:
 - If content is empty / extraction failed: set workspace = "Inbox", summary = "Extraction failed — open URL manually.", key_points = [], tags = [source_type], suggested_must_read = false.`;
 
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+const GEMINI_EMBED_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent';
+const EMBED_INPUT_TRUNCATE = 8000;
+const EMBED_DIM = 768; // Matryoshka truncation — matches `embedding vector(768)` schema.
 const VAULT_BASE = '/files/obsidian-vault';
 const RAW_CONTENT_TRUNCATE = 50000;
 
@@ -673,6 +676,74 @@ return {
 });
 
 // ---------------------------------------------------------------------------
+// 6b. Gemini Embed — gemini-embedding-001 truncated to 768 dims for pgvector
+//     semantic search. text-embedding-004 was deprecated; the v1beta endpoint
+//     now returns 404 for it. gemini-embedding-001 is Matryoshka: native 3072
+//     dims, request `outputDimensionality: 768` to match our column. taskType
+//     SEMANTIC_SIMILARITY is the correct choice for /search by query.
+//     Reuses googlePalmApi cred via nodeCredentialType (same trick as classify).
+// ---------------------------------------------------------------------------
+const geminiEmbed = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.4,
+  config: {
+    name: 'Gemini Embed',
+    parameters: {
+      method: 'POST',
+      url: GEMINI_EMBED_URL,
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'googlePalmApi',
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr(`={{ JSON.stringify({
+  model: 'models/gemini-embedding-001',
+  content: {
+    parts: [{
+      text: (($json.title || '') + '\\n' + ($json.summary || '') + '\\n' + (Array.isArray($json._key_points) ? $json._key_points.join('\\n') : '')).slice(0, ${EMBED_INPUT_TRUNCATE})
+    }]
+  },
+  outputDimensionality: ${EMBED_DIM},
+  taskType: 'SEMANTIC_SIMILARITY'
+}) }}`),
+      options: { timeout: 30000 }
+    },
+    credentials: { googlePalmApi: newCredential('Google Gemini(PaLM) Api account') },
+    retryOnFail: true,
+    maxTries: 4,
+    waitBetweenTries: 3000,
+    position: [1880, 280]
+  },
+  output: [{ embedding: { values: [0.01, 0.02, 0.03] } }]
+});
+
+// ---------------------------------------------------------------------------
+// 6c. Attach Embedding — merge Parse+Derive payload with embedding values.
+//     pgvector accepts text literal '[v1,v2,...]'. We stringify the array here
+//     and let SQL cast via (p->>'embedding')::vector — keeps everything inside
+//     the single $1::jsonb arg (avoids the comma-split queryReplacement bug).
+// ---------------------------------------------------------------------------
+const attachEmbedding = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: {
+    name: 'Attach Embedding',
+    parameters: {
+      mode: 'runOnceForEachItem',
+      language: 'javaScript',
+      jsCode: `const parsed = $('Parse + Derive').item.json;
+const values = ($json.embedding && $json.embedding.values) || [];
+if (!Array.isArray(values) || values.length !== 768) {
+  throw new Error('Gemini embed returned ' + (values && values.length) + ' dims, expected 768');
+}
+return { json: { ...parsed, embedding: '[' + values.join(',') + ']' } };`
+    },
+    position: [2120, 280]
+  },
+  output: [{ embedding: '[0.01,0.02,0.03]' }]
+});
+
+// ---------------------------------------------------------------------------
 // 7. Postgres INSERT into hivemind.bookmarks with RETURNING id.
 // ---------------------------------------------------------------------------
 const supabaseInsert = node({
@@ -684,11 +755,13 @@ const supabaseInsert = node({
       resource: 'database',
       operation: 'executeQuery',
       // n8n's `queryReplacement` is naive comma-split — any value containing a
-      // comma (titles, summaries) shatters the param list. Collapse all values
-      // into a single `$1::jsonb` parameter and extract columns inside SQL.
+      // comma (titles, summaries, embedding vector) shatters the param list.
+      // Collapse all values into a single `$1::jsonb` parameter and extract
+      // columns inside SQL. Embedding arrives as text literal '[v1,v2,...]'
+      // (see Attach Embedding) and is cast directly to pgvector.
       query: `with payload as (select $1::jsonb as p)
 insert into hivemind.bookmarks
-  (url, url_hash, source_type, workspace, title, summary, key_points, tags, must_read, raw_content, telegram_msg_id, obsidian_path)
+  (url, url_hash, source_type, workspace, title, summary, key_points, tags, must_read, raw_content, telegram_msg_id, obsidian_path, embedding)
 select
   p->>'url',
   p->>'url_hash',
@@ -701,7 +774,8 @@ select
   (p->>'must_read')::bool,
   p->>'raw_content',
   (p->>'telegram_msg_id')::int,
-  p->>'obsidian_path'
+  p->>'obsidian_path',
+  (p->>'embedding')::vector
 from payload
 on conflict (url_hash) do update set
   url = excluded.url,
@@ -712,14 +786,15 @@ on conflict (url_hash) do update set
   tags = excluded.tags,
   must_read = excluded.must_read,
   raw_content = excluded.raw_content,
-  obsidian_path = excluded.obsidian_path
+  obsidian_path = excluded.obsidian_path,
+  embedding = excluded.embedding
 returning id;`,
       options: {
         queryReplacement: expr('={{ JSON.stringify($json) }}')
       }
     },
     credentials: { postgres: newCredential('supabase-hivemind') },
-    position: [1880, 280]
+    position: [2360, 280]
   },
   output: [{ id: 1 }]
 });
@@ -793,7 +868,7 @@ return {
   }
 };`
     },
-    position: [2120, 280]
+    position: [2600, 280]
   },
   output: [{ supabase_id: 1, obsidian_path: '/files/obsidian-vault/AI & LLMs/2026-05-20-x.md' }]
 });
@@ -816,7 +891,7 @@ const writeFile = node({
       dataPropertyName: 'data',
       options: { append: false }
     },
-    position: [2360, 280]
+    position: [2840, 280]
   },
   output: [{ fileName: '/files/obsidian-vault/AI & LLMs/2026-05-20-x.md' }]
 });
@@ -837,7 +912,7 @@ const telegramOk = node({
       additionalFields: { appendAttribution: false }
     },
     credentials: { telegramApi: newCredential('telegram-hivemind') },
-    position: [2600, 280]
+    position: [3080, 280]
   },
   output: [{ ok: true }]
 });
@@ -854,13 +929,17 @@ const telegramOk = node({
 //                    web       → jinaFetch     ─┐
 //                    youtube   → jinaYoutube   ─┤→ geminiClassify
 //                    x         → jinaX         ─┤   → parseClassification
-//                    instagram → jinaInstagram ─┘     → supabaseInsert
+//                    instagram → jinaInstagram ─┘     → geminiEmbed
+//                                                       → attachEmbedding
+//                                                       → supabaseInsert
 //                                                       → renderMarkdown
 //                                                       → writeFile → telegramOk
 //   none         → telegramNoUrl
 // ---------------------------------------------------------------------------
 const shared = geminiClassify
   .to(parseClassification)
+  .to(geminiEmbed)
+  .to(attachEmbedding)
   .to(supabaseInsert)
   .to(renderMarkdown)
   .to(writeFile)
