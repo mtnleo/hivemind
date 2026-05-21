@@ -1,6 +1,10 @@
-// Hivemind — Ingest (web + YouTube + X + Instagram)
-// Sprint 3: Telegram URL → Extract URL (host-detect) → Has URL? → Route Source (switch)
-//           → per-source Jina fetch → Gemini classify+summarize → Supabase + Obsidian → reply.
+// Hivemind — Ingest (web + YouTube + X + Instagram) + /star command
+// Sprint 4: Telegram message → Extract URL (detects /star | url | none)
+//           → Route Message (switch) branches:
+//             - star          → Mark Must-Read (PG) → Found? → vault read+rewrite+write → ⭐ reply
+//             - star_invalid  → Reply: Star Usage
+//             - url           → Route Source (per-source Jina fetch + Gemini + save) → ✅ reply
+//             - none          → Reply: No URL
 //
 // Per-source fetch nodes today all use Jina Reader (r.jina.ai/<url>). Same API surface,
 // distinct nodes so each branch can be swapped later (e.g. yt-dlp transcript service for
@@ -110,20 +114,33 @@ const extractUrl = node({
       language: 'javaScript',
       // URL class is unreliable in n8n Code sandbox — use pure regex for host detection.
       // Tracking param strip via regex for dedup hash (UNIQUE constraint on url_hash).
+      // Emits one of three messageType values:
+      //   - 'star'         → /star <int>            (also sets starId)
+      //   - 'star_invalid' → /star with bad/no arg
+      //   - 'url'          → first https?://… in message  (sets url, sourceType, urlHash)
+      //   - 'none'         → no command, no URL
       jsCode: `const msg = $json.message || {};
 const text = (msg.text || msg.caption || '').trim();
-const match = text.match(/https?:\\/\\/[^\\s]+/);
-if (!match) {
-  return {
-    json: {
-      hasUrl: false,
-      chatId: msg.chat ? msg.chat.id : null,
-      telegramMsgId: msg.message_id || null,
-      rawText: text
-    }
-  };
+const chatId = msg.chat ? msg.chat.id : null;
+const telegramMsgId = msg.message_id || null;
+const base = { chatId, telegramMsgId, rawText: text };
+
+// /star command detection (e.g. "/star 7" or "/star@BotName 7").
+const starMatch = text.match(/^\\/star(?:@[A-Za-z0-9_]+)?(?:\\s+(.+))?\\s*$/);
+if (starMatch) {
+  const arg = (starMatch[1] || '').trim();
+  if (/^\\d+$/.test(arg)) {
+    return { json: { ...base, messageType: 'star', starId: parseInt(arg, 10), hasUrl: false } };
+  }
+  return { json: { ...base, messageType: 'star_invalid', hasUrl: false } };
 }
-const rawUrl = match[0];
+
+// URL extraction.
+const m = text.match(/https?:\\/\\/[^\\s]+/);
+if (!m) {
+  return { json: { ...base, messageType: 'none', hasUrl: false } };
+}
+const rawUrl = m[0];
 const hostMatch = rawUrl.match(/^https?:\\/\\/([^/?#]+)/);
 const rawHost = hostMatch ? hostMatch[1].toLowerCase() : '';
 const host = rawHost.replace(/^www\\./, '');
@@ -139,20 +156,21 @@ const TRACKING = /[?&](utm_source|utm_medium|utm_campaign|utm_term|utm_content|u
 const normalized = rawUrl.replace(TRACKING, '').replace(/[?&]$/, '').replace(/\\?&/, '?');
 return {
   json: {
+    ...base,
+    messageType: 'url',
     hasUrl: true,
     url: rawUrl,
     normalizedUrl: normalized,
     urlHash: normalized,
     host,
-    sourceType,
-    chatId: msg.chat.id,
-    telegramMsgId: msg.message_id
+    sourceType
   }
 };`
     },
     position: [440, 400]
   },
   output: [{
+    messageType: 'url',
     hasUrl: true,
     url: 'https://www.anthropic.com/news/example-article',
     urlHash: 'deadbeef',
@@ -163,28 +181,234 @@ return {
 });
 
 // ---------------------------------------------------------------------------
-// 3. URL gate — ifElse routes to fetch+save (true) or no-URL reply (false).
+// 3. Route Message — single Switch on `messageType`. Replaces the S3 "Has URL?"
+//    If node. Four explicit outputs (no fallback) so adding new commands later
+//    is just another rule.
 // ---------------------------------------------------------------------------
-const urlGate = ifElse({
-  type: 'n8n-nodes-base.if',
-  version: 2.3,
+function messageTypeRule(value: string, key: string) {
+  return {
+    conditions: {
+      options: { caseSensitive: true, leftValue: '', typeValidation: 'loose' },
+      conditions: [{
+        leftValue: expr('={{ $json.messageType }}'),
+        rightValue: value,
+        operator: { type: 'string', operation: 'equals' }
+      }],
+      combinator: 'and'
+    },
+    renameOutput: true,
+    outputKey: key
+  };
+}
+
+const routeMessage = node({
+  type: 'n8n-nodes-base.switch',
+  version: 3.2,
   config: {
-    name: 'Has URL?',
+    name: 'Route Message',
     parameters: {
-      conditions: {
-        conditions: [{
-          leftValue: expr('={{ $json.hasUrl }}'),
-          rightValue: true,
-          operator: { type: 'boolean', operation: 'true' }
-        }]
-      }
+      rules: {
+        values: [
+          messageTypeRule('star', 'star'),
+          messageTypeRule('star_invalid', 'star_invalid'),
+          messageTypeRule('url', 'url'),
+          messageTypeRule('none', 'none')
+        ]
+      },
+      options: {}
     },
     position: [680, 400]
   }
 });
 
 // ---------------------------------------------------------------------------
-// 4a. Telegram reply on no-URL branch (terminal).
+// 4a. /star branch — Postgres UPDATE → vault rewrite → ⭐ Telegram reply.
+//
+// `Mark Must-Read` always returns exactly one row (COALESCE/EXISTS trick) so a
+// missing id still surfaces a `found=false` row downstream instead of zero
+// items (which would silently drop the Telegram reply).
+// ---------------------------------------------------------------------------
+const markMustRead = node({
+  type: 'n8n-nodes-base.postgres',
+  version: 2.6,
+  config: {
+    name: 'Mark Must-Read',
+    parameters: {
+      resource: 'database',
+      operation: 'executeQuery',
+      // Single $1::jsonb arg avoids n8n's naive comma-split queryReplacement.
+      query: `with upd as (
+  update hivemind.bookmarks
+    set must_read = true
+  where id = (($1::jsonb)->>'starId')::int
+  returning id, title, obsidian_path
+)
+select
+  coalesce((select id from upd), 0)::int as id,
+  coalesce((select title from upd), '')::text as title,
+  coalesce((select obsidian_path from upd), '')::text as obsidian_path,
+  exists(select 1 from upd) as found,
+  (($1::jsonb)->>'starId')::int as requested_id,
+  (($1::jsonb)->>'chatId')::bigint as chat_id;`,
+      options: {
+        queryReplacement: expr('={{ JSON.stringify({ starId: $json.starId, chatId: $json.chatId }) }}')
+      }
+    },
+    credentials: { postgres: newCredential('supabase-hivemind') },
+    position: [920, 80]
+  },
+  output: [{ id: 7, title: 'Example', obsidian_path: '/files/obsidian-vault/Inbox/2026-05-20-x.md', found: true, requested_id: 7, chat_id: 8837789534 }]
+});
+
+// Route on numeric `id` instead of the boolean `found` — the n8n If v2.3
+// `boolean: true` operator misroutes Postgres boolean values to the TRUE branch
+// even when they arrive as JS false. Number-gt-0 sidesteps the coercion entirely.
+const foundGate = ifElse({
+  type: 'n8n-nodes-base.if',
+  version: 2.3,
+  config: {
+    name: 'Found?',
+    parameters: {
+      conditions: {
+        options: { caseSensitive: true, leftValue: '', typeValidation: 'strict' },
+        conditions: [{
+          leftValue: expr('={{ $json.id }}'),
+          rightValue: 0,
+          operator: { type: 'number', operation: 'gt' }
+        }],
+        combinator: 'and'
+      }
+    },
+    position: [1160, 80]
+  }
+});
+
+const readVaultFile = node({
+  type: 'n8n-nodes-base.readWriteFile',
+  version: 1.1,
+  config: {
+    name: 'Read Vault File',
+    parameters: {
+      operation: 'read',
+      fileSelector: expr('={{ $json.obsidian_path }}'),
+      options: { dataPropertyName: 'data' }
+    },
+    position: [1400, 0]
+  },
+  output: [{ data: '---\nmust_read: false\n---\n# x' }]
+});
+
+const updateFrontmatter = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: {
+    name: 'Update Frontmatter',
+    // Decode the read binary, swap `must_read: false` → `must_read: true` on
+    // the first matching line (frontmatter sits at top), re-emit as binary.
+    //
+    // GOTCHA: with N8N_DEFAULT_BINARY_DATA_MODE=filesystem (current Pi env),
+    // `binary.data.data` is a `filesystem-v2:…` REFERENCE string, NOT inline
+    // base64. Decoding it as base64 silently corrupts the payload and clobbers
+    // the file. Always resolve via `helpers.getBinaryDataBuffer` — works
+    // regardless of storage mode.
+    parameters: {
+      mode: 'runOnceForEachItem',
+      language: 'javaScript',
+      jsCode: `const pgRow = $('Mark Must-Read').item.json;
+const bin = $input.item.binary && $input.item.binary.data;
+if (!bin) {
+  throw new Error('No vault file binary for ' + (pgRow && pgRow.obsidian_path));
+}
+const buf = await this.helpers.getBinaryDataBuffer(0, 'data');
+const text = buf.toString('utf8');
+const updated = text.replace(/^must_read:\\s*false\\s*$/m, 'must_read: true');
+return {
+  json: { ...pgRow, vault_updated: updated !== text },
+  binary: {
+    data: {
+      data: Buffer.from(updated, 'utf8').toString('base64'),
+      mimeType: 'text/markdown',
+      fileName: bin.fileName || 'note.md'
+    }
+  }
+};`
+    },
+    position: [1640, 0]
+  },
+  output: [{ vault_updated: true }]
+});
+
+const writeStarVaultFile = node({
+  type: 'n8n-nodes-base.readWriteFile',
+  version: 1.1,
+  config: {
+    name: 'Write Star Vault File',
+    parameters: {
+      operation: 'write',
+      fileName: expr("={{ $('Mark Must-Read').item.json.obsidian_path }}"),
+      dataPropertyName: 'data',
+      options: { append: false }
+    },
+    position: [1880, 0]
+  }
+});
+
+const replyStarred = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Starred',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr("={{ $('Mark Must-Read').item.json.chat_id }}"),
+      text: expr("={{ '⭐ Marked #' + $('Mark Must-Read').item.json.id + ' as must-read: ' + ($('Mark Must-Read').item.json.title || '(untitled)') }}"),
+      additionalFields: { appendAttribution: false }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [2120, 0]
+  },
+  output: [{ ok: true }]
+});
+
+const replyStarMissing = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Star Missing',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr("={{ $('Mark Must-Read').item.json.chat_id }}"),
+      text: expr("={{ 'No bookmark found with id ' + $('Mark Must-Read').item.json.requested_id + '.' }}"),
+      additionalFields: { appendAttribution: false }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [1400, 200]
+  },
+  output: [{ ok: true }]
+});
+
+const replyStarUsage = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Star Usage',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr('={{ $json.chatId }}'),
+      text: 'Usage: /star <id> — e.g. /star 7',
+      additionalFields: { appendAttribution: false }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [920, 700]
+  },
+  output: [{ ok: true }]
+});
+
+// ---------------------------------------------------------------------------
+// 4b. Telegram reply on no-URL / no-command branch (terminal).
 // ---------------------------------------------------------------------------
 const telegramNoUrl = node({
   type: 'n8n-nodes-base.telegram',
@@ -205,7 +429,7 @@ const telegramNoUrl = node({
 });
 
 // ---------------------------------------------------------------------------
-// 4b. Route Source — Switch v3 branches by sourceType set in Extract URL.
+// 4c. Route Source — Switch v3 branches by sourceType set in Extract URL.
 //     All 4 branches currently use Jina Reader (same fetch, separate nodes so
 //     each can be swapped later — e.g. yt-dlp transcript service for YouTube).
 // ---------------------------------------------------------------------------
@@ -620,13 +844,20 @@ const telegramOk = node({
 
 // ---------------------------------------------------------------------------
 // Wire it up.
-// telegramTrigger → extractUrl → urlGate
-//   FALSE → telegramNoUrl (terminal)
-//   TRUE  → routeSource (Switch)
-//             web       → jinaFetch    ─┐
-//             youtube   → jinaYoutube  ─┤→ geminiClassify → parseClassification
-//             x         → jinaX        ─┤   → supabaseInsert → renderMarkdown
-//             instagram → jinaInstagram─┘      → writeFile → telegramOk
+// telegramTrigger → extractUrl → routeMessage (Switch)
+//   star         → markMustRead → foundGate
+//                    TRUE  → readVaultFile → updateFrontmatter
+//                              → writeStarVaultFile → replyStarred
+//                    FALSE → replyStarMissing
+//   star_invalid → replyStarUsage
+//   url          → routeSource (Switch)
+//                    web       → jinaFetch     ─┐
+//                    youtube   → jinaYoutube   ─┤→ geminiClassify
+//                    x         → jinaX         ─┤   → parseClassification
+//                    instagram → jinaInstagram ─┘     → supabaseInsert
+//                                                       → renderMarkdown
+//                                                       → writeFile → telegramOk
+//   none         → telegramNoUrl
 // ---------------------------------------------------------------------------
 const shared = geminiClassify
   .to(parseClassification)
@@ -635,13 +866,19 @@ const shared = geminiClassify
   .to(writeFile)
   .to(telegramOk);
 
-export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube + X + Instagram)')
+const starBranch = markMustRead.to(foundGate
+  .onTrue(readVaultFile.to(updateFrontmatter).to(writeStarVaultFile).to(replyStarred))
+  .onFalse(replyStarMissing));
+
+export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube + X + Instagram) + /star')
   .add(telegramTrigger)
   .to(extractUrl)
-  .to(urlGate
-    .onTrue(routeSource
+  .to(routeMessage
+    .branch(0, starBranch)
+    .branch(1, replyStarUsage)
+    .branch(2, routeSource
       .branch(0, jinaFetch.to(shared))
       .branch(1, jinaYoutube.to(shared))
       .branch(2, jinaX.to(shared))
       .branch(3, jinaInstagram.to(shared)))
-    .onFalse(telegramNoUrl));
+    .branch(3, telegramNoUrl));
