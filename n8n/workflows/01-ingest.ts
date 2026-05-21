@@ -1011,7 +1011,14 @@ const formatResults = node({
       // Telegram is called with parse_mode=HTML on Reply: Search so URLs with
       // `_` (e.g. x.com/user_name) don't get interpreted as italic by the
       // default Markdown parser. HTML mode only requires escaping `<`, `>`, `&`.
-      jsCode: `const ex = $('Extract URL').first().json;
+      //
+      // Relative gap cutoff: Postgres always returns top 5 by cosine distance
+      // (cheap, rides HNSW). We then drop results that are noticeably farther
+      // from #1 than MAX_GAP (cosine). On a tight cluster of related items,
+      // gaps stay small and all 5 survive; on a lone-wolf query, only #1
+      // survives. Keeps #1 always so the bot never reduces to "no results".
+      jsCode: `const MAX_GAP = 0.10;
+const ex = $('Extract URL').first().json;
 const chatId = ex.chatId;
 const query = ex.searchQuery || '';
 const items = $input.all();
@@ -1024,13 +1031,15 @@ function esc(s) {
 if (items.length === 0) {
   return [{ json: { chat_id: chatId, text: 'No bookmarks yet — send me a URL first.' } }];
 }
-const lines = items.map((it, i) => {
+const topD = Number(items[0].json.distance);
+const kept = items.filter((it, i) => i === 0 || (Number(it.json.distance) - topD) <= MAX_GAP);
+const lines = kept.map((it, i) => {
   const r = it.json;
   const star = r.must_read ? '⭐ ' : '';
   const ws = r.workspace ? ' — [' + esc(r.workspace) + ']' : '';
   return (i + 1) + '. ' + star + esc(r.title || '(untitled)') + ws + '\\n   ' + esc(r.url || '');
 });
-const header = '🔍 Top ' + items.length + ' for \\'' + esc(query) + '\\':';
+const header = '🔍 Top ' + kept.length + ' for \\'' + esc(query) + '\\':';
 return [{ json: { chat_id: chatId, text: header + '\\n' + lines.join('\\n') } }];`
     },
     position: [1400, 840]
