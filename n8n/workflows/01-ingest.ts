@@ -108,8 +108,8 @@ const extractUrl = node({
     parameters: {
       mode: 'runOnceForEachItem',
       language: 'javaScript',
-      // n8n Code node sandbox blocks `require('crypto')`. Skip hashing —
-      // store normalized URL as `url_hash`; UNIQUE constraint still dedups.
+      // URL class is unreliable in n8n Code sandbox — use pure regex for host detection.
+      // Tracking param strip via regex for dedup hash (UNIQUE constraint on url_hash).
       jsCode: `const msg = $json.message || {};
 const text = (msg.text || msg.caption || '').trim();
 const match = text.match(/https?:\\/\\/[^\\s]+/);
@@ -123,24 +123,10 @@ if (!match) {
     }
   };
 }
-const TRACKING = new Set([
-  'utm_source','utm_medium','utm_campaign','utm_term','utm_content','utm_id',
-  'gclid','fbclid','mc_cid','mc_eid','igshid','ref','ref_src','ref_url',
-  's','si','feature','app'
-]);
-let normalized = match[0];
-let host = '';
-try {
-  const u = new URL(match[0]);
-  u.hostname = u.hostname.toLowerCase().replace(/^www\\./, '');
-  host = u.hostname;
-  u.hash = '';
-  const kept = [...u.searchParams.entries()].filter(([k]) => !TRACKING.has(k.toLowerCase()));
-  u.search = '';
-  for (const [k, v] of kept) u.searchParams.append(k, v);
-  if (u.pathname.length > 1 && u.pathname.endsWith('/')) u.pathname = u.pathname.slice(0, -1);
-  normalized = u.toString();
-} catch (_) { }
+const rawUrl = match[0];
+const hostMatch = rawUrl.match(/^https?:\\/\\/([^/?#]+)/);
+const rawHost = hostMatch ? hostMatch[1].toLowerCase() : '';
+const host = rawHost.replace(/^www\\./, '');
 function detectSource(h) {
   if (!h) return 'web';
   if (h === 'youtube.com' || h === 'm.youtube.com' || h === 'youtu.be' || h.endsWith('.youtube.com')) return 'youtube';
@@ -149,10 +135,12 @@ function detectSource(h) {
   return 'web';
 }
 const sourceType = detectSource(host);
+const TRACKING = /[?&](utm_source|utm_medium|utm_campaign|utm_term|utm_content|utm_id|gclid|fbclid|mc_cid|mc_eid|igshid|ref|ref_src|ref_url|si|feature|app)=[^&]*/gi;
+const normalized = rawUrl.replace(TRACKING, '').replace(/[?&]$/, '').replace(/\\?&/, '?');
 return {
   json: {
     hasUrl: true,
-    url: match[0],
+    url: rawUrl,
     normalizedUrl: normalized,
     urlHash: normalized,
     host,
