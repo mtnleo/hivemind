@@ -117,11 +117,13 @@ const extractUrl = node({
       language: 'javaScript',
       // URL class is unreliable in n8n Code sandbox — use pure regex for host detection.
       // Tracking param strip via regex for dedup hash (UNIQUE constraint on url_hash).
-      // Emits one of three messageType values:
-      //   - 'star'         → /star <int>            (also sets starId)
-      //   - 'star_invalid' → /star with bad/no arg
-      //   - 'url'          → first https?://… in message  (sets url, sourceType, urlHash)
-      //   - 'none'         → no command, no URL
+      // Emits one of six messageType values:
+      //   - 'star'            → /star <int>             (also sets starId)
+      //   - 'star_invalid'    → /star with bad/no arg
+      //   - 'search'          → /search <query>         (also sets searchQuery)
+      //   - 'search_invalid'  → bare /search with no query
+      //   - 'url'             → first https?://… in message  (sets url, sourceType, urlHash)
+      //   - 'none'            → no command, no URL
       jsCode: `const msg = $json.message || {};
 const text = (msg.text || msg.caption || '').trim();
 const chatId = msg.chat ? msg.chat.id : null;
@@ -136,6 +138,16 @@ if (starMatch) {
     return { json: { ...base, messageType: 'star', starId: parseInt(arg, 10), hasUrl: false } };
   }
   return { json: { ...base, messageType: 'star_invalid', hasUrl: false } };
+}
+
+// /search command detection (e.g. "/search agentic engineering").
+const searchMatch = text.match(/^\\/search(?:@[A-Za-z0-9_]+)?(?:\\s+([\\s\\S]+))?\\s*$/);
+if (searchMatch) {
+  const q = (searchMatch[1] || '').trim();
+  if (q.length > 0) {
+    return { json: { ...base, messageType: 'search', searchQuery: q, hasUrl: false } };
+  }
+  return { json: { ...base, messageType: 'search_invalid', hasUrl: false } };
 }
 
 // URL extraction.
@@ -185,8 +197,8 @@ return {
 
 // ---------------------------------------------------------------------------
 // 3. Route Message — single Switch on `messageType`. Replaces the S3 "Has URL?"
-//    If node. Four explicit outputs (no fallback) so adding new commands later
-//    is just another rule.
+//    If node. Six explicit outputs (no fallback). Output index = port number;
+//    appending new outputs preserves existing branch wiring.
 // ---------------------------------------------------------------------------
 function messageTypeRule(value: string, key: string) {
   return {
@@ -215,7 +227,9 @@ const routeMessage = node({
           messageTypeRule('star', 'star'),
           messageTypeRule('star_invalid', 'star_invalid'),
           messageTypeRule('url', 'url'),
-          messageTypeRule('none', 'none')
+          messageTypeRule('none', 'none'),
+          messageTypeRule('search', 'search'),
+          messageTypeRule('search_invalid', 'search_invalid')
         ]
       },
       options: {}
@@ -918,23 +932,164 @@ const telegramOk = node({
 });
 
 // ---------------------------------------------------------------------------
+// 11. /search branch — embed query → cosine-rank top 5 → reply.
+//
+// Query embedding uses the SAME model + task as ingest (gemini-embedding-001,
+// 768 dims, taskType SEMANTIC_SIMILARITY) so the doc-side embeddings live in
+// the same vector space. Postgres uses `<=>` (cosine distance) and rides the
+// HNSW index `bookmarks_embedding_hnsw_idx` (vector_cosine_ops).
+// ---------------------------------------------------------------------------
+const embedQuery = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.4,
+  config: {
+    name: 'Embed Query',
+    parameters: {
+      method: 'POST',
+      url: GEMINI_EMBED_URL,
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'googlePalmApi',
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr(`={{ JSON.stringify({
+  model: 'models/gemini-embedding-001',
+  content: { parts: [{ text: ($json.searchQuery || '').slice(0, ${EMBED_INPUT_TRUNCATE}) }] },
+  outputDimensionality: ${EMBED_DIM},
+  taskType: 'SEMANTIC_SIMILARITY'
+}) }}`),
+      options: { timeout: 30000 }
+    },
+    credentials: { googlePalmApi: newCredential('Google Gemini(PaLM) Api account') },
+    retryOnFail: true,
+    maxTries: 4,
+    waitBetweenTries: 3000,
+    position: [920, 840]
+  },
+  output: [{ embedding: { values: [0.01, 0.02] } }]
+});
+
+const vectorSearch = node({
+  type: 'n8n-nodes-base.postgres',
+  version: 2.6,
+  config: {
+    name: 'Vector Search',
+    parameters: {
+      resource: 'database',
+      operation: 'executeQuery',
+      // `<=>` is the cosine distance operator from pgvector. Lower = closer.
+      // qvec arrives as text literal `[v1,v2,...]` in the $1 jsonb arg.
+      // `embedding is not null` is defensive — backfill is complete but keeps
+      // the index hot path stable if future rows ever land without an embed.
+      query: `select id, title, workspace, url, must_read,
+       (embedding <=> ($1::jsonb->>'qvec')::vector) as distance
+from hivemind.bookmarks
+where embedding is not null
+order by embedding <=> ($1::jsonb->>'qvec')::vector
+limit 5;`,
+      options: {
+        queryReplacement: expr(`={{ JSON.stringify({ qvec: '[' + $json.embedding.values.join(',') + ']' }) }}`)
+      }
+    },
+    credentials: { postgres: newCredential('supabase-hivemind') },
+    position: [1160, 840]
+  },
+  output: [{ id: 14, title: 'x', workspace: 'AI & LLMs', url: 'https://x', must_read: false, distance: 0.12 }]
+});
+
+// Aggregator: Postgres emits N items (one per row). runOnceForAllItems lets us
+// fold the whole result set into a single Telegram message. Empty input
+// (table-wide no embeddings) → "No bookmarks yet." reply with carried chatId.
+const formatResults = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: {
+    name: 'Format Results',
+    parameters: {
+      mode: 'runOnceForAllItems',
+      language: 'javaScript',
+      jsCode: `const ex = $('Extract URL').first().json;
+const chatId = ex.chatId;
+const query = ex.searchQuery || '';
+const items = $input.all();
+if (items.length === 0) {
+  return [{ json: { chat_id: chatId, text: 'No bookmarks yet — send me a URL first.' } }];
+}
+const lines = items.map((it, i) => {
+  const r = it.json;
+  const star = r.must_read ? '⭐ ' : '';
+  const ws = r.workspace ? ' — [' + r.workspace + ']' : '';
+  return (i + 1) + '. ' + star + (r.title || '(untitled)') + ws + '\\n   ' + (r.url || '');
+});
+const header = '🔍 Top ' + items.length + " for '" + query + "':";
+return [{ json: { chat_id: chatId, text: header + '\\n' + lines.join('\\n') } }];`
+    },
+    position: [1400, 840]
+  },
+  output: [{ chat_id: 8837789534, text: '🔍 Top 5 for ...' }]
+});
+
+const replySearch = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Search',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr('={{ $json.chat_id }}'),
+      text: expr('={{ $json.text }}'),
+      // disable_web_page_preview prevents 5 URLs from each spawning a giant
+      // unfurled card under the message.
+      additionalFields: {
+        appendAttribution: false,
+        disable_web_page_preview: true
+      }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [1640, 840]
+  },
+  output: [{ ok: true }]
+});
+
+const replySearchUsage = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Search Usage',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr('={{ $json.chatId }}'),
+      text: 'Usage: /search <query> — e.g. /search agentic engineering',
+      additionalFields: { appendAttribution: false }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [920, 980]
+  },
+  output: [{ ok: true }]
+});
+
+// ---------------------------------------------------------------------------
 // Wire it up.
 // telegramTrigger → extractUrl → routeMessage (Switch)
-//   star         → markMustRead → foundGate
-//                    TRUE  → readVaultFile → updateFrontmatter
-//                              → writeStarVaultFile → replyStarred
-//                    FALSE → replyStarMissing
-//   star_invalid → replyStarUsage
-//   url          → routeSource (Switch)
-//                    web       → jinaFetch     ─┐
-//                    youtube   → jinaYoutube   ─┤→ geminiClassify
-//                    x         → jinaX         ─┤   → parseClassification
-//                    instagram → jinaInstagram ─┘     → geminiEmbed
-//                                                       → attachEmbedding
-//                                                       → supabaseInsert
-//                                                       → renderMarkdown
-//                                                       → writeFile → telegramOk
-//   none         → telegramNoUrl
+//   star            → markMustRead → foundGate
+//                       TRUE  → readVaultFile → updateFrontmatter
+//                                 → writeStarVaultFile → replyStarred
+//                       FALSE → replyStarMissing
+//   star_invalid    → replyStarUsage
+//   url             → routeSource (Switch)
+//                       web       → jinaFetch     ─┐
+//                       youtube   → jinaYoutube   ─┤→ geminiClassify
+//                       x         → jinaX         ─┤   → parseClassification
+//                       instagram → jinaInstagram ─┘     → geminiEmbed
+//                                                          → attachEmbedding
+//                                                          → supabaseInsert
+//                                                          → renderMarkdown
+//                                                          → writeFile → telegramOk
+//   none            → telegramNoUrl
+//   search          → embedQuery → vectorSearch → formatResults → replySearch
+//   search_invalid  → replySearchUsage
 // ---------------------------------------------------------------------------
 const shared = geminiClassify
   .to(parseClassification)
@@ -949,7 +1104,9 @@ const starBranch = markMustRead.to(foundGate
   .onTrue(readVaultFile.to(updateFrontmatter).to(writeStarVaultFile).to(replyStarred))
   .onFalse(replyStarMissing));
 
-export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube + X + Instagram) + /star')
+const searchBranch = embedQuery.to(vectorSearch).to(formatResults).to(replySearch);
+
+export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube + X + Instagram) + /star + /search')
   .add(telegramTrigger)
   .to(extractUrl)
   .to(routeMessage
@@ -960,4 +1117,6 @@ export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube +
       .branch(1, jinaYoutube.to(shared))
       .branch(2, jinaX.to(shared))
       .branch(3, jinaInstagram.to(shared)))
-    .branch(3, telegramNoUrl));
+    .branch(3, telegramNoUrl)
+    .branch(4, searchBranch)
+    .branch(5, replySearchUsage));
