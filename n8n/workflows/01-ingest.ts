@@ -1008,20 +1008,29 @@ const formatResults = node({
     parameters: {
       mode: 'runOnceForAllItems',
       language: 'javaScript',
+      // Telegram is called with parse_mode=HTML on Reply: Search so URLs with
+      // `_` (e.g. x.com/user_name) don't get interpreted as italic by the
+      // default Markdown parser. HTML mode only requires escaping `<`, `>`, `&`.
       jsCode: `const ex = $('Extract URL').first().json;
 const chatId = ex.chatId;
 const query = ex.searchQuery || '';
 const items = $input.all();
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 if (items.length === 0) {
   return [{ json: { chat_id: chatId, text: 'No bookmarks yet — send me a URL first.' } }];
 }
 const lines = items.map((it, i) => {
   const r = it.json;
   const star = r.must_read ? '⭐ ' : '';
-  const ws = r.workspace ? ' — [' + r.workspace + ']' : '';
-  return (i + 1) + '. ' + star + (r.title || '(untitled)') + ws + '\\n   ' + (r.url || '');
+  const ws = r.workspace ? ' — [' + esc(r.workspace) + ']' : '';
+  return (i + 1) + '. ' + star + esc(r.title || '(untitled)') + ws + '\\n   ' + esc(r.url || '');
 });
-const header = '🔍 Top ' + items.length + " for '" + query + "':";
+const header = '🔍 Top ' + items.length + ' for \\'' + esc(query) + '\\':';
 return [{ json: { chat_id: chatId, text: header + '\\n' + lines.join('\\n') } }];`
     },
     position: [1400, 840]
@@ -1039,11 +1048,17 @@ const replySearch = node({
       operation: 'sendMessage',
       chatId: expr('={{ $json.chat_id }}'),
       text: expr('={{ $json.text }}'),
-      // disable_web_page_preview prevents 5 URLs from each spawning a giant
-      // unfurled card under the message.
+      // parse_mode MUST be set to HTML — n8n Telegram v1.2 defaults to
+      // Markdown, which trips on `_` inside URLs (e.g. x.com/user_name) and
+      // returns "Bad Request: can't parse entities". The n8n API rejects
+      // parse_mode='' (empty string), so HTML is the safe escape hatch: only
+      // `<`, `>`, `&` need escaping (done in Format Results' `esc()` helper).
+      // disableWebPagePreview (camelCase, NOT snake_case as Telegram's raw
+      // API uses) suppresses the unfurl card under each of the 5 URLs.
       additionalFields: {
         appendAttribution: false,
-        disable_web_page_preview: true
+        parse_mode: 'HTML',
+        disableWebPagePreview: true
       }
     },
     credentials: { telegramApi: newCredential('telegram-hivemind') },
