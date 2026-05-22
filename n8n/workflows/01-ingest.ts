@@ -1,10 +1,19 @@
-// Hivemind — Ingest (web + YouTube + X + Instagram) + /star command
-// Sprint 4: Telegram message → Extract URL (detects /star | url | none)
-//           → Route Message (switch) branches:
-//             - star          → Mark Must-Read (PG) → Found? → vault read+rewrite+write → ⭐ reply
-//             - star_invalid  → Reply: Star Usage
-//             - url           → Route Source (per-source Jina fetch + Gemini + save) → ✅ reply
-//             - none          → Reply: No URL
+// Hivemind — Ingest (web + YouTube + X + Instagram) + /star + /search + /forget + /list
+// Sprint 5d adds: /forget <id>, /list, /list <n>.
+// Route Message (Switch v3.2) outputs in append-only order — index = port number:
+//   0 star            → Mark Must-Read → Found? → vault rewrite → ⭐ reply
+//   1 star_invalid    → Reply: Star Usage
+//   2 url             → Route Source → per-source ingest → ✅ reply
+//   3 none            → Reply: No URL
+//   4 search          → Embed Query → Vector Search → Format Results → reply
+//   5 search_invalid  → Reply: Search Usage
+//   6 forget          → Mark Deleted → Forget Found? → Reply: Forgotten
+//                                                  ↘ Reply: Forget Missing
+//                       (vault file kept — n8n sandbox blocks fs/path/exec)
+//   7 forget_invalid  → Reply: Forget Usage
+//   8 list_workspaces → Workspaces → Format Workspaces → Reply: Workspaces
+//   9 list_workspace  → Workspaces By N → Pick Nth → List Bookmarks → Format List → reply
+//  10 list_invalid    → Reply: List Usage
 //
 // Per-source fetch nodes today all use Jina Reader (r.jina.ai/<url>). Same API surface,
 // distinct nodes so each branch can be swapped later (e.g. yt-dlp transcript service for
@@ -117,11 +126,16 @@ const extractUrl = node({
       language: 'javaScript',
       // URL class is unreliable in n8n Code sandbox — use pure regex for host detection.
       // Tracking param strip via regex for dedup hash (UNIQUE constraint on url_hash).
-      // Emits one of six messageType values:
+      // Emits one of eleven messageType values:
       //   - 'star'            → /star <int>             (also sets starId)
       //   - 'star_invalid'    → /star with bad/no arg
       //   - 'search'          → /search <query>         (also sets searchQuery)
       //   - 'search_invalid'  → bare /search with no query
+      //   - 'forget'          → /forget <int>           (also sets forgetId)
+      //   - 'forget_invalid'  → /forget with bad/no arg
+      //   - 'list_workspaces' → bare /list              (lists workspaces with counts)
+      //   - 'list_workspace'  → /list <int>             (also sets listN; lists bookmarks)
+      //   - 'list_invalid'    → /list with non-numeric arg
       //   - 'url'             → first https?://… in message  (sets url, sourceType, urlHash)
       //   - 'none'            → no command, no URL
       jsCode: `const msg = $json.message || {};
@@ -148,6 +162,29 @@ if (searchMatch) {
     return { json: { ...base, messageType: 'search', searchQuery: q, hasUrl: false } };
   }
   return { json: { ...base, messageType: 'search_invalid', hasUrl: false } };
+}
+
+// /forget command detection.
+const forgetMatch = text.match(/^\\/forget(?:@[A-Za-z0-9_]+)?(?:\\s+(.+))?\\s*$/);
+if (forgetMatch) {
+  const arg = (forgetMatch[1] || '').trim();
+  if (/^\\d+$/.test(arg)) {
+    return { json: { ...base, messageType: 'forget', forgetId: parseInt(arg, 10), hasUrl: false } };
+  }
+  return { json: { ...base, messageType: 'forget_invalid', hasUrl: false } };
+}
+
+// /list  OR  /list <n>
+const listMatch = text.match(/^\\/list(?:@[A-Za-z0-9_]+)?(?:\\s+(.+))?\\s*$/);
+if (listMatch) {
+  const arg = (listMatch[1] || '').trim();
+  if (arg === '') {
+    return { json: { ...base, messageType: 'list_workspaces', hasUrl: false } };
+  }
+  if (/^\\d+$/.test(arg)) {
+    return { json: { ...base, messageType: 'list_workspace', listN: parseInt(arg, 10), hasUrl: false } };
+  }
+  return { json: { ...base, messageType: 'list_invalid', hasUrl: false } };
 }
 
 // URL extraction.
@@ -229,7 +266,13 @@ const routeMessage = node({
           messageTypeRule('url', 'url'),
           messageTypeRule('none', 'none'),
           messageTypeRule('search', 'search'),
-          messageTypeRule('search_invalid', 'search_invalid')
+          messageTypeRule('search_invalid', 'search_invalid'),
+          // Sprint 5d — append-only (output index = port number).
+          messageTypeRule('forget', 'forget'),
+          messageTypeRule('forget_invalid', 'forget_invalid'),
+          messageTypeRule('list_workspaces', 'list_workspaces'),
+          messageTypeRule('list_workspace', 'list_workspace'),
+          messageTypeRule('list_invalid', 'list_invalid')
         ]
       },
       options: {}
@@ -1099,6 +1142,360 @@ const replySearchUsage = node({
 });
 
 // ---------------------------------------------------------------------------
+// 12. /forget branch — hard DELETE row. Vault file kept in place.
+//
+// File move to _trash/ is blocked: n8n Code sandbox disallows `require('fs')`
+// and `require('path')`, and `n8n-nodes-base.executeCommand` is excluded by
+// NODES_EXCLUDE on this instance (see audit). readWriteFile has no delete
+// operation. Sprint 5d MVP: drop the file move. Reply tells the user the
+// vault path so they can delete manually in Obsidian.
+//
+// Re-enabling fs (NODE_FUNCTION_ALLOW_BUILTIN=fs,path on the Pi) would let us
+// restore the original Move To Trash node — kept in git history for reference.
+// ---------------------------------------------------------------------------
+const markDeleted = node({
+  type: 'n8n-nodes-base.postgres',
+  version: 2.6,
+  config: {
+    name: 'Mark Deleted',
+    parameters: {
+      resource: 'database',
+      operation: 'executeQuery',
+      query: `with del as (
+  delete from hivemind.bookmarks
+  where id = (($1::jsonb)->>'forgetId')::int
+  returning id, title, obsidian_path
+)
+select
+  coalesce((select id from del), 0)::int as id,
+  coalesce((select title from del), '')::text as title,
+  coalesce((select obsidian_path from del), '')::text as obsidian_path,
+  exists(select 1 from del) as found,
+  (($1::jsonb)->>'forgetId')::int as requested_id,
+  (($1::jsonb)->>'chatId')::bigint as chat_id;`,
+      options: {
+        queryReplacement: expr('={{ JSON.stringify({ forgetId: $json.forgetId, chatId: $json.chatId }) }}')
+      }
+    },
+    credentials: { postgres: newCredential('supabase-hivemind') },
+    position: [880, 2100]
+  }
+});
+
+const forgetFound = ifElse({
+  type: 'n8n-nodes-base.if',
+  version: 2.3,
+  config: {
+    name: 'Forget Found?',
+    parameters: {
+      conditions: {
+        options: { caseSensitive: true, leftValue: '', typeValidation: 'strict' },
+        conditions: [{
+          leftValue: expr('={{ $json.id }}'),
+          rightValue: 0,
+          operator: { type: 'number', operation: 'gt' }
+        }],
+        combinator: 'and'
+      }
+    },
+    position: [1104, 2100]
+  }
+});
+
+const replyForgotten = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Forgotten',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr("={{ $('Mark Deleted').item.json.chat_id }}"),
+      text: expr("={{ '🗑️ Forgotten #' + $('Mark Deleted').item.json.id + ': ' + ($('Mark Deleted').item.json.title || '(untitled)') + '\\nVault file kept at ' + $('Mark Deleted').item.json.obsidian_path + ' — delete manually in Obsidian if you want.' }}"),
+      additionalFields: { appendAttribution: false }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [1360, 2000]
+  }
+});
+
+const replyForgetMissing = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Forget Missing',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr("={{ $('Mark Deleted').item.json.chat_id }}"),
+      text: expr("={{ 'No bookmark found with id ' + $('Mark Deleted').item.json.requested_id + '.' }}"),
+      additionalFields: { appendAttribution: false }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [1360, 2200]
+  }
+});
+
+const replyForgetUsage = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Forget Usage',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr('={{ $json.chatId }}'),
+      text: 'Usage: /forget <id> — e.g. /forget 13',
+      additionalFields: { appendAttribution: false }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [928, 2400]
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 13. /list workspaces (bare) — group-by workspace, numbered + counts.
+//     The numbering here is the index user passes to /list <n>.
+// ---------------------------------------------------------------------------
+const WORKSPACES_SQL = `select workspace, count(*)::int as n
+from hivemind.bookmarks
+group by workspace
+order by count(*) desc, workspace asc;`;
+
+const workspacesQuery = node({
+  type: 'n8n-nodes-base.postgres',
+  version: 2.6,
+  config: {
+    name: 'Workspaces',
+    parameters: {
+      resource: 'database',
+      operation: 'executeQuery',
+      query: WORKSPACES_SQL,
+      options: {}
+    },
+    credentials: { postgres: newCredential('supabase-hivemind') },
+    position: [928, 2600]
+  }
+});
+
+const formatWorkspaces = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: {
+    name: 'Format Workspaces',
+    parameters: {
+      mode: 'runOnceForAllItems',
+      language: 'javaScript',
+      jsCode: `const ex = $('Extract URL').first().json;
+const chatId = ex.chatId;
+const items = $input.all();
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+if (items.length === 0) {
+  return [{ json: { chat_id: chatId, text: 'No bookmarks yet — send me a URL first.' } }];
+}
+const lines = items.map((it, i) => {
+  const r = it.json;
+  return (i + 1) + '. ' + esc(r.workspace || '(none)') + ' (' + r.n + ')';
+});
+const header = '📚 Workspaces:';
+// \`<n>\` would trip Telegram's HTML parser (parse_mode=HTML on Reply: Workspaces).
+// Use escaped angle brackets so the message renders literally.
+const footer = '\\nUse /list &lt;n&gt; to list bookmarks in a workspace.';
+return [{ json: { chat_id: chatId, text: header + '\\n' + lines.join('\\n') + footer } }];`
+    },
+    position: [1168, 2600]
+  }
+});
+
+const replyWorkspaces = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Workspaces',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr('={{ $json.chat_id }}'),
+      text: expr('={{ $json.text }}'),
+      additionalFields: {
+        appendAttribution: false,
+        parse_mode: 'HTML',
+        disableWebPagePreview: true
+      }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [1408, 2600]
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 14. /list <n> — same ordered group-by, pick row n-1, select bookmarks.
+//     Pick Nth emits one row carrying the chosen workspace name so
+//     downstream Postgres can filter `where workspace = ($1::jsonb)->>'workspace'`.
+//     If listN is out of range, emit out_of_range sentinel — Format List
+//     turns that into a usage reply (instead of a different Switch branch).
+// ---------------------------------------------------------------------------
+const workspacesByN = node({
+  type: 'n8n-nodes-base.postgres',
+  version: 2.6,
+  config: {
+    name: 'Workspaces By N',
+    parameters: {
+      resource: 'database',
+      operation: 'executeQuery',
+      query: WORKSPACES_SQL,
+      options: {}
+    },
+    credentials: { postgres: newCredential('supabase-hivemind') },
+    position: [928, 2800]
+  }
+});
+
+const pickNth = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: {
+    name: 'Pick Nth',
+    parameters: {
+      mode: 'runOnceForAllItems',
+      language: 'javaScript',
+      jsCode: `const ex = $('Extract URL').first().json;
+const chatId = ex.chatId;
+const n = parseInt(ex.listN, 10);
+const items = $input.all();
+const idx = n - 1;
+if (!Number.isFinite(n) || n < 1 || idx >= items.length) {
+  return [{ json: { chat_id: chatId, listN: n, workspace: '', out_of_range: true, total: items.length } }];
+}
+const chosen = items[idx].json;
+return [{ json: { chat_id: chatId, listN: n, workspace: chosen.workspace, out_of_range: false, total: items.length } }];`
+    },
+    position: [1168, 2800]
+  }
+});
+
+const listBookmarks = node({
+  type: 'n8n-nodes-base.postgres',
+  version: 2.6,
+  config: {
+    name: 'List Bookmarks',
+    parameters: {
+      resource: 'database',
+      operation: 'executeQuery',
+      // limit 21 so Format List can detect overflow ("+more").
+      query: `select id, title, url, must_read
+from hivemind.bookmarks
+where workspace = ($1::jsonb)->>'workspace'
+order by created_at desc
+limit 21;`,
+      options: {
+        queryReplacement: expr("={{ JSON.stringify({ workspace: $json.workspace }) }}")
+      }
+    },
+    credentials: { postgres: newCredential('supabase-hivemind') },
+    // Force an empty item when SQL returns 0 rows so Format List still runs
+    // (else n8n short-circuits and /list <n> with out-of-range n is silent).
+    alwaysOutputData: true,
+    position: [1408, 2800]
+  }
+});
+
+const formatList = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: {
+    name: 'Format List',
+    parameters: {
+      mode: 'runOnceForAllItems',
+      language: 'javaScript',
+      // Mirrors /search Format Results: numbered, ⭐ for must_read, title +
+      // indented URL. APOS quote trick + HTML esc(). Cap at 20 visible,
+      // overflow suffix if 21 rows returned.
+      jsCode: `const APOS = String.fromCharCode(39);
+const ex = $('Extract URL').first().json;
+const pick = $('Pick Nth').first().json;
+const chatId = ex.chatId;
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+if (pick.out_of_range) {
+  const total = pick.total;
+  const msg = total === 0
+    ? 'No workspaces yet — send me a URL first.'
+    : ('No workspace #' + pick.listN + ' — use /list to see numbered workspaces (1..' + total + ').');
+  return [{ json: { chat_id: chatId, text: msg } }];
+}
+// alwaysOutputData on List Bookmarks injects an empty {json:{}} item when
+// the query returns 0 rows — filter it out before counting.
+const items = $input.all().filter(it => it.json && it.json.id != null);
+if (items.length === 0) {
+  return [{ json: { chat_id: chatId, text: 'No bookmarks in workspace ' + APOS + esc(pick.workspace) + APOS + '.' } }];
+}
+const visible = items.slice(0, 20);
+const overflow = items.length > 20;
+const lines = visible.map((it, i) => {
+  const r = it.json;
+  const star = r.must_read ? '⭐ ' : '';
+  return (i + 1) + '. ' + star + esc(r.title || '(untitled)') + '\\n   ' + esc(r.url || '');
+});
+const header = '📁 ' + APOS + esc(pick.workspace) + APOS + ' — ' + visible.length + ' bookmark' + (visible.length === 1 ? '' : 's') + ':';
+let text = header + '\\n' + lines.join('\\n');
+if (overflow) {
+  text += '\\n+more — use /search to find specifics';
+}
+return [{ json: { chat_id: chatId, text } }];`
+    },
+    position: [1648, 2800]
+  }
+});
+
+const replyWorkspaceList = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Workspace List',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr('={{ $json.chat_id }}'),
+      text: expr('={{ $json.text }}'),
+      additionalFields: {
+        appendAttribution: false,
+        parse_mode: 'HTML',
+        disableWebPagePreview: true
+      }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [1888, 2800]
+  }
+});
+
+const replyListUsage = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: List Usage',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr('={{ $json.chatId }}'),
+      text: 'Usage: /list (lists workspaces) or /list <n> (lists bookmarks in workspace #n).',
+      additionalFields: { appendAttribution: false }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [928, 3000]
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Wire it up.
 // telegramTrigger → extractUrl → routeMessage (Switch)
 //   star            → markMustRead → foundGate
@@ -1118,6 +1515,14 @@ const replySearchUsage = node({
 //   none            → telegramNoUrl
 //   search          → embedQuery → vectorSearch → formatResults → replySearch
 //   search_invalid  → replySearchUsage
+//   forget          → markDeleted → forgetFound
+//                       TRUE  → replyForgotten     (vault file kept; fs blocked)
+//                       FALSE → replyForgetMissing
+//   forget_invalid  → replyForgetUsage
+//   list_workspaces → workspacesQuery → formatWorkspaces → replyWorkspaces
+//   list_workspace  → workspacesByN → pickNth → listBookmarks
+//                                              → formatList → replyWorkspaceList
+//   list_invalid    → replyListUsage
 // ---------------------------------------------------------------------------
 const shared = geminiClassify
   .to(parseClassification)
@@ -1134,7 +1539,14 @@ const starBranch = markMustRead.to(foundGate
 
 const searchBranch = embedQuery.to(vectorSearch).to(formatResults).to(replySearch);
 
-export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube + X + Instagram) + /star + /search')
+const forgetBranch = markDeleted.to(forgetFound
+  .onTrue(replyForgotten)
+  .onFalse(replyForgetMissing));
+
+const listWorkspacesBranch = workspacesQuery.to(formatWorkspaces).to(replyWorkspaces);
+const listWorkspaceBranch = workspacesByN.to(pickNth).to(listBookmarks).to(formatList).to(replyWorkspaceList);
+
+export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube + X + Instagram) + /star + /search + /forget + /list')
   .add(telegramTrigger)
   .to(extractUrl)
   .to(routeMessage
@@ -1147,4 +1559,9 @@ export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube +
       .branch(3, jinaInstagram.to(shared)))
     .branch(3, telegramNoUrl)
     .branch(4, searchBranch)
-    .branch(5, replySearchUsage));
+    .branch(5, replySearchUsage)
+    .branch(6, forgetBranch)
+    .branch(7, replyForgetUsage)
+    .branch(8, listWorkspacesBranch)
+    .branch(9, listWorkspaceBranch)
+    .branch(10, replyListUsage));
