@@ -1,0 +1,16 @@
+[Unit]
+Description=Hivemind vault watcher (inotify -> n8n webhook)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mtnleo
+ExecStart=/usr/bin/python3 /home/mtnleo/n8n-compose/vault-watch.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
