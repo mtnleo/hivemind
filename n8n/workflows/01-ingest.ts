@@ -1,5 +1,5 @@
-// Hivemind — Ingest (web + YouTube + X + Instagram) + /star + /search + /forget + /list
-// Sprint 5d adds: /forget <id>, /list, /list <n>.
+// Hivemind — Ingest (web + YouTube + X + Instagram) + /star + /search + /forget + /list + /ask
+// Sprint 6a adds: /ask <question> — RAG Q&A (embed → cosine top-10 → Gemini synth → reply).
 // Route Message (Switch v3.2) outputs in append-only order — index = port number:
 //   0 star            → Mark Must-Read → Found? → vault rewrite → ⭐ reply
 //   1 star_invalid    → Reply: Star Usage
@@ -14,6 +14,9 @@
 //   8 list_workspaces → Workspaces → Format Workspaces → Reply: Workspaces
 //   9 list_workspace  → Workspaces By N → Pick Nth → List Bookmarks → Format List → reply
 //  10 list_invalid    → Reply: List Usage
+//  11 ask             → Embed Query (Ask) → Search Bookmarks (Ask) → Build Context →
+//                       Gemini Ask → Format Answer → Reply: Ask
+//  12 ask_invalid     → Reply: Ask Usage
 //
 // Per-source fetch nodes today all use Jina Reader (r.jina.ai/<url>). Same API surface,
 // distinct nodes so each branch can be swapped later (e.g. yt-dlp transcript service for
@@ -78,6 +81,11 @@ Rules:
 - If content is empty / extraction failed: set workspace = "Inbox", summary = "Extraction failed — open URL manually.", key_points = [], tags = [source_type], suggested_must_read = false.`;
 
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+// Sprint 6a: /ask reuses gemini-2.5-flash. The brief said 2.0-flash but on
+// this Google AI Studio account the 2.0-flash free-tier quota is hard-zero
+// ("limit: 0"). 2.5-flash is the only Flash model with a working free tier
+// here — confirmed via 429 with `Quota exceeded ... limit: 0, model: gemini-2.0-flash`.
+const GEMINI_ASK_URL = GEMINI_URL;
 const GEMINI_EMBED_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent';
 const EMBED_INPUT_TRUNCATE = 8000;
 const EMBED_DIM = 768; // Matryoshka truncation — matches `embedding vector(768)` schema.
@@ -162,6 +170,16 @@ if (searchMatch) {
     return { json: { ...base, messageType: 'search', searchQuery: q, hasUrl: false } };
   }
   return { json: { ...base, messageType: 'search_invalid', hasUrl: false } };
+}
+
+// /ask command detection (e.g. "/ask what are best practices for agentic AI?").
+const askMatch = text.match(/^\\/ask(?:@[A-Za-z0-9_]+)?(?:\\s+([\\s\\S]+))?\\s*$/);
+if (askMatch) {
+  const q = (askMatch[1] || '').trim();
+  if (q.length > 0) {
+    return { json: { ...base, messageType: 'ask', askQuery: q, hasUrl: false } };
+  }
+  return { json: { ...base, messageType: 'ask_invalid', hasUrl: false } };
 }
 
 // /forget command detection.
@@ -272,7 +290,10 @@ const routeMessage = node({
           messageTypeRule('forget_invalid', 'forget_invalid'),
           messageTypeRule('list_workspaces', 'list_workspaces'),
           messageTypeRule('list_workspace', 'list_workspace'),
-          messageTypeRule('list_invalid', 'list_invalid')
+          messageTypeRule('list_invalid', 'list_invalid'),
+          // Sprint 6a — /ask RAG Q&A (outputs 11, 12).
+          messageTypeRule('ask', 'ask'),
+          messageTypeRule('ask_invalid', 'ask_invalid')
         ]
       },
       options: {}
@@ -1496,6 +1517,242 @@ const replyListUsage = node({
 });
 
 // ---------------------------------------------------------------------------
+// 12. /ask branch — RAG Q&A. Embed question → cosine top-10 → Gemini synth → reply.
+//
+// Query embedding uses the SAME model + task as ingest (gemini-embedding-001,
+// 768 dims, taskType SEMANTIC_SIMILARITY). Retrieval mirrors /search but pulls
+// top 10 (broader context window) and includes `summary` for the synth prompt.
+// Generation uses gemini-2.0-flash specifically (per S6a brief) — free tier
+// with comfortable headroom; classify keeps 2.5-flash unchanged.
+// ---------------------------------------------------------------------------
+const embedQueryAsk = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.4,
+  config: {
+    name: 'Embed Query (Ask)',
+    parameters: {
+      method: 'POST',
+      url: GEMINI_EMBED_URL,
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'googlePalmApi',
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr(`={{ JSON.stringify({
+  model: 'models/gemini-embedding-001',
+  content: { parts: [{ text: ($json.askQuery || '').slice(0, ${EMBED_INPUT_TRUNCATE}) }] },
+  outputDimensionality: ${EMBED_DIM},
+  taskType: 'SEMANTIC_SIMILARITY'
+}) }}`),
+      options: { timeout: 30000 }
+    },
+    credentials: { googlePalmApi: newCredential('Google Gemini(PaLM) Api account') },
+    retryOnFail: true,
+    maxTries: 4,
+    waitBetweenTries: 3000,
+    position: [920, 3200]
+  },
+  output: [{ embedding: { values: [0.01, 0.02] } }]
+});
+
+// Top-10 cosine (vs /search top-5) — RAG benefits from a wider context window.
+// `deleted_at is null` matches /forget soft-delete semantics. `alwaysOutputData`
+// ensures Build Context still runs even on a zero-row corpus.
+const searchBookmarksAsk = node({
+  type: 'n8n-nodes-base.postgres',
+  version: 2.6,
+  config: {
+    name: 'Search Bookmarks (Ask)',
+    parameters: {
+      resource: 'database',
+      operation: 'executeQuery',
+      query: `select id, title, url, workspace, must_read, summary,
+       (embedding <=> ($1::jsonb->>'qvec')::vector) as distance
+from hivemind.bookmarks
+where embedding is not null
+order by embedding <=> ($1::jsonb->>'qvec')::vector
+limit 10;`,
+      options: {
+        queryReplacement: expr(`={{ JSON.stringify({ qvec: '[' + $json.embedding.values.join(',') + ']' }) }}`)
+      }
+    },
+    credentials: { postgres: newCredential('supabase-hivemind') },
+    alwaysOutputData: true,
+    position: [1160, 3200]
+  },
+  output: [{ id: 14, title: 'x', workspace: 'AI & LLMs', url: 'https://x', must_read: false, summary: '...', distance: 0.12 }]
+});
+
+// Build the RAG prompt context: apply relative-gap cutoff (MAX_GAP = 0.12,
+// looser than /search's 0.10 — synthesis tolerates noisier sources), format a
+// numbered source block for the LLM, and build a Telegram footer string.
+// Always emits a single item with the same key shape (sourcesBlock, footer,
+// askQuery, chatId) so downstream Gemini node never short-circuits.
+const buildContext = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: {
+    name: 'Build Context',
+    parameters: {
+      mode: 'runOnceForAllItems',
+      language: 'javaScript',
+      jsCode: `const MAX_GAP = 0.12;
+const APOS = String.fromCharCode(39);
+const ex = $('Extract URL').first().json;
+const chatId = ex.chatId;
+const askQuery = ex.askQuery || '';
+const raw = $input.all().filter(it => it.json && it.json.id != null);
+if (raw.length === 0) {
+  return [{ json: {
+    chatId: chatId,
+    askQuery: askQuery,
+    sourcesBlock: '(no sources found in your library)',
+    footer: '(none)',
+    sourceCount: 0
+  } }];
+}
+const topD = Number(raw[0].json.distance);
+const kept = raw.filter((it, i) => i === 0 || (Number(it.json.distance) - topD) <= MAX_GAP);
+const sourcesBlock = kept.map((it, i) => {
+  const r = it.json;
+  const ws = r.workspace || '(none)';
+  const sum = r.summary || '';
+  return '[' + (i + 1) + '] ' + (r.title || '(untitled)') + ' — ' + ws +
+         '\\nURL: ' + (r.url || '') +
+         (sum ? '\\nSummary: ' + sum : '');
+}).join('\\n\\n');
+const footer = kept.map(it => '#' + it.json.id + ' (' + (it.json.workspace || 'none') + ')').join(', ');
+return [{ json: {
+  chatId: chatId,
+  askQuery: askQuery,
+  sourcesBlock: sourcesBlock,
+  footer: footer,
+  sourceCount: kept.length
+} }];`
+    },
+    position: [1400, 3200]
+  },
+  output: [{ chatId: 8837789534, askQuery: 'what...', sourcesBlock: '[1] ...', footer: '#14 (AI & LLMs)', sourceCount: 3 }]
+});
+
+// Gemini synth — gemini-2.0-flash. System prompt constrains the model to use
+// only provided sources, cite inline as [1] [2], and admit gaps honestly.
+// generationConfig.temperature 0.3 = mildly creative, mostly factual.
+const geminiAsk = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.4,
+  config: {
+    name: 'Gemini Ask',
+    parameters: {
+      method: 'POST',
+      url: GEMINI_ASK_URL,
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'googlePalmApi',
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr(`={{ JSON.stringify({
+  systemInstruction: { parts: [{ text: 'You are a personal knowledge assistant. Answer the user question using ONLY the sources provided below. Be specific and concise. Cite source numbers inline like [1], [2]. If the sources do not cover the question, say so plainly.' }] },
+  contents: [{ role: 'user', parts: [{ text: 'Sources:\\n' + ($json.sourcesBlock || '') + '\\n\\nQuestion: ' + ($json.askQuery || '') }] }],
+  generationConfig: { temperature: 0.3, maxOutputTokens: 1024 }
+}) }}`),
+      options: { timeout: 30000 }
+    },
+    credentials: { googlePalmApi: newCredential('Google Gemini(PaLM) Api account') },
+    retryOnFail: true,
+    maxTries: 4,
+    waitBetweenTries: 3000,
+    position: [1640, 3200]
+  },
+  output: [{ candidates: [{ content: { parts: [{ text: 'Based on [1]...' }] } }] }]
+});
+
+// Format the Gemini response for Telegram: extract concatenated text from
+// candidates[0].content.parts[*].text, HTML-escape, prepend header, append
+// sources footer. Truncate body before footer to stay under Telegram 4096.
+const formatAnswer = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: {
+    name: 'Format Answer',
+    parameters: {
+      mode: 'runOnceForFirstItem',
+      language: 'javaScript',
+      jsCode: `const ex = $('Extract URL').first().json;
+const ctx = $('Build Context').first().json;
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+const resp = $json || {};
+const parts = (((resp.candidates || [])[0] || {}).content || {}).parts || [];
+let text = parts.map(p => (p && p.text) ? p.text : '').join('').trim();
+if (!text) text = '(no answer)';
+const MAX_ANSWER = 3600;
+if (text.length > MAX_ANSWER) text = text.slice(0, MAX_ANSWER) + '…';
+const out = '🔍 <b>Answer</b>\\n\\n' + esc(text) +
+            '\\n\\n<i>Sources: ' + esc(ctx.footer || '(none)') + '</i>';
+return [{ json: { chat_id: ex.chatId, text: out } }];`
+    },
+    position: [1880, 3200]
+  },
+  output: [{ chat_id: 8837789534, text: '🔍 <b>Answer</b>...' }]
+});
+
+// Belt-and-suspenders parse_mode (engram #40 + S5d gotcha): set BOTH
+// snake_case `parse_mode` and camelCase `parseMode` keys in additionalFields.
+// n8n PUT sanitization has been observed to drop one or the other depending
+// on schema version; double-key survives the round-trip.
+const replyAsk = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Ask',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr('={{ $json.chat_id }}'),
+      text: expr('={{ $json.text }}'),
+      additionalFields: {
+        appendAttribution: false,
+        parse_mode: 'HTML',
+        parseMode: 'HTML',
+        disableWebPagePreview: true
+      }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [2120, 3200]
+  },
+  output: [{ ok: true }]
+});
+
+// Usage hint — literal angle-bracketed placeholder is HTML-escaped so the
+// `<question>` token renders safely under parse_mode=HTML.
+const replyAskUsage = node({
+  type: 'n8n-nodes-base.telegram',
+  version: 1.2,
+  config: {
+    name: 'Reply: Ask Usage',
+    parameters: {
+      resource: 'message',
+      operation: 'sendMessage',
+      chatId: expr('={{ $json.chatId }}'),
+      text: 'Usage: /ask &lt;question&gt;\n\nAsk anything about your saved bookmarks. I will search your library and synthesize an answer.\n\nExample: /ask what are the best practices for agentic AI?',
+      additionalFields: {
+        appendAttribution: false,
+        parse_mode: 'HTML',
+        parseMode: 'HTML',
+        disableWebPagePreview: true
+      }
+    },
+    credentials: { telegramApi: newCredential('telegram-hivemind') },
+    position: [928, 3400]
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Wire it up.
 // telegramTrigger → extractUrl → routeMessage (Switch)
 //   star            → markMustRead → foundGate
@@ -1523,6 +1780,9 @@ const replyListUsage = node({
 //   list_workspace  → workspacesByN → pickNth → listBookmarks
 //                                              → formatList → replyWorkspaceList
 //   list_invalid    → replyListUsage
+//   ask             → embedQueryAsk → searchBookmarksAsk → buildContext
+//                                   → geminiAsk → formatAnswer → replyAsk
+//   ask_invalid     → replyAskUsage
 // ---------------------------------------------------------------------------
 const shared = geminiClassify
   .to(parseClassification)
@@ -1546,7 +1806,14 @@ const forgetBranch = markDeleted.to(forgetFound
 const listWorkspacesBranch = workspacesQuery.to(formatWorkspaces).to(replyWorkspaces);
 const listWorkspaceBranch = workspacesByN.to(pickNth).to(listBookmarks).to(formatList).to(replyWorkspaceList);
 
-export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube + X + Instagram) + /star + /search + /forget + /list')
+const askBranch = embedQueryAsk
+  .to(searchBookmarksAsk)
+  .to(buildContext)
+  .to(geminiAsk)
+  .to(formatAnswer)
+  .to(replyAsk);
+
+export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube + X + Instagram) + /star + /search + /forget + /list + /ask')
   .add(telegramTrigger)
   .to(extractUrl)
   .to(routeMessage
@@ -1564,4 +1831,6 @@ export default workflow('hivemind-ingest', 'Hivemind — Ingest (web + YouTube +
     .branch(7, replyForgetUsage)
     .branch(8, listWorkspacesBranch)
     .branch(9, listWorkspaceBranch)
-    .branch(10, replyListUsage));
+    .branch(10, replyListUsage)
+    .branch(11, askBranch)
+    .branch(12, replyAskUsage));
